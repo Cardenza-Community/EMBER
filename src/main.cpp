@@ -219,10 +219,52 @@ static const Theme THEME_TERMINAL_GREEN = {
     rgb565(0, 0, 0),           // visIdle
 };
 
+// Inspired by the celebrated "Tokyo Night" theme (enkia).
+static const Theme THEME_TOKYO_NIGHT = {
+    rgb565(26, 27, 38),        // bg           #1a1b26
+    rgb565(22, 22, 30),        // header       #16161e (statusline)
+    rgb565(192, 202, 245),     // headerText   #c0caf5
+    rgb565(125, 207, 255),     // folder       #7dcfff (cyan)
+    rgb565(192, 202, 245),     // file         #c0caf5
+    rgb565(51, 70, 124),       // selBg        #33467c (selection)
+    rgb565(192, 202, 245),     // selFg        #c0caf5
+    rgb565(86, 95, 137),       // dim          #565f89 (comment)
+    rgb565(158, 206, 106),     // play         #9ece6a (green)
+    rgb565(192, 202, 245),     // npText       #c0caf5
+    rgb565(122, 162, 247),     // volumeIcon   #7aa2f7 (blue)
+    rgb565(187, 154, 247),     // progressDot  #bb9af7 (magenta)
+    rgb565(224, 175, 104),     // visMid       #e0af68 (yellow)
+    rgb565(247, 118, 142),     // visHigh      #f7768e (red)
+    rgb565(22, 22, 30),        // npBg         #16161e
+    rgb565(41, 46, 66),        // visIdle      #292e42 (line highlight)
+};
+
+// Inspired by the classic "Amber on Black" CRT phosphor look.
+static const Theme THEME_AMBER = {
+    rgb565(0, 0, 0),           // bg           #000000
+    rgb565(16, 10, 0),         // header       #100a00 (faint amber tint)
+    rgb565(255, 176, 0),       // headerText   #ffb000 (amber phosphor)
+    rgb565(255, 176, 0),       // folder       #ffb000
+    rgb565(255, 176, 0),       // file         #ffb000
+    rgb565(64, 44, 0),         // selBg        #402c00
+    rgb565(0, 0, 0),           // selFg        black on amber
+    rgb565(128, 88, 0),        // dim          #805800
+    rgb565(255, 176, 0),       // play         #ffb000
+    rgb565(255, 176, 0),       // npText       #ffb000
+    rgb565(255, 176, 0),       // volumeIcon   #ffb000
+    rgb565(255, 200, 80),      // progressDot  lighter amber
+    rgb565(255, 176, 0),       // visMid       #ffb000
+    rgb565(255, 220, 128),     // visHigh      brightest amber
+    rgb565(0, 0, 0),           // npBg         #000000
+    rgb565(40, 28, 0),         // visIdle      #281c00
+};
+
 // All available themes, cycled from Settings -> Theme; Ember is always the
 // default at boot (index 0), regardless of what's added after it.
-static const Theme* const THEME_LIST[] = { &THEME_EMBER, &THEME_90S_SWEATER, &THEME_AQUA, &THEME_HONEY, &THEME_MOODY, &THEME_TERMINAL_GREEN };
-static const char* THEME_LABELS[] = { "Ember", "90's Sweater", "Aqua", "Honey", "Moody", "Terminal Green" };
+static const Theme* const THEME_LIST[] = { &THEME_EMBER, &THEME_90S_SWEATER, &THEME_AQUA, &THEME_HONEY, &THEME_MOODY, &THEME_TERMINAL_GREEN,
+    &THEME_TOKYO_NIGHT, &THEME_AMBER };
+static const char* THEME_LABELS[] = { "Ember", "90's Sweater", "Aqua", "Honey", "Moody", "Terminal Green",
+    "Tokyo Night", "Amber on Black" };
 static const int THEME_COUNT = sizeof(THEME_LIST) / sizeof(THEME_LIST[0]);
 
 // User themes loaded from /themes/*.json on SD at boot (see loadCustomThemes()
