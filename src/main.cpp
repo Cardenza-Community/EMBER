@@ -2,6 +2,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <Preferences.h>
+#include <driver/i2s.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -296,7 +297,16 @@ static int settingThemeIdx = 0;   // default Ember (THEME_LIST[0])
 static const char* onOffLabels[] = { "Off", "On" };
 static bool settingScreenshotsEnabled = false;
 
-static const int SETTINGS_COUNT = 5;
+// External I2S DAC (e.g. a UDA1334A breakout) on the second, otherwise-free
+// I2S peripheral -- see AudioOutputM5Speaker::flush() and initExtI2S()
+// further down. Defaults to the onboard speaker; nothing about the external
+// path is auto-detected (the DAC has no way to signal it's connected), so
+// this is purely a user choice.
+enum AudioOutputMode { AUDIO_OUT_INTERNAL, AUDIO_OUT_EXTERNAL, AUDIO_OUT_MODE_COUNT };
+static const char* audioOutputLabels[AUDIO_OUT_MODE_COUNT] = { "Internal", "External DAC" };
+static AudioOutputMode settingAudioOutput = AUDIO_OUT_INTERNAL;
+
+static const int SETTINGS_COUNT = 6;
 static int settingsCursor = 0;
 
 // Rows visible at once in the settings box -- SETTINGS_COUNT no longer fits
@@ -319,12 +329,14 @@ static void loadSettings() {
     albumEndMode = (AlbumEndMode)settingsPrefs.getInt("albumEnd", ALBUM_STOP);
     settingThemeIdx = settingsPrefs.getInt("themeIdx", 0);
     settingScreenshotsEnabled = settingsPrefs.getBool("screenshots", false);
+    settingAudioOutput = (AudioOutputMode)settingsPrefs.getInt("audioOut", AUDIO_OUT_INTERNAL);
     settingsPrefs.end();
 
     if (settingBacklightIdx < 0 || settingBacklightIdx >= BACKLIGHT_COUNT) settingBacklightIdx = BACKLIGHT_COUNT - 1;
     if (settingScreenOffIdx < 0 || settingScreenOffIdx >= SCREEN_OFF_COUNT) settingScreenOffIdx = 2;
     if (albumEndMode < 0 || albumEndMode >= ALBUM_END_MODE_COUNT) albumEndMode = ALBUM_STOP;
     if (settingThemeIdx < 0) settingThemeIdx = 0;   // re-clamped against totalThemeCount() once custom themes load
+    if (settingAudioOutput < 0 || settingAudioOutput >= AUDIO_OUT_MODE_COUNT) settingAudioOutput = AUDIO_OUT_INTERNAL;
 }
 
 // Called after every settings change (see cycleSetting()) -- infrequent,
@@ -336,6 +348,7 @@ static void saveSettings() {
     settingsPrefs.putInt("albumEnd", (int)albumEndMode);
     settingsPrefs.putInt("themeIdx", settingThemeIdx);
     settingsPrefs.putBool("screenshots", settingScreenshotsEnabled);
+    settingsPrefs.putInt("audioOut", (int)settingAudioOutput);
     settingsPrefs.end();
 }
 
@@ -394,6 +407,44 @@ static int16_t visRawBuf[VISRAW_FRAMES * 2];
 // Same one-pole low-pass tap as visBassRatio, just exposed unblended.
 static float lastBassEnvelope = 0.0f;
 
+// ---------- External I2S DAC (Settings -> Audio output) ----------
+// A second, independent I2S peripheral (I2S_NUM_0) driving an off-board DAC
+// (e.g. a UDA1334A breakout) via the rear header. The built-in speaker/mic
+// are hardwired to I2S_NUM_1 on GPIO41/42/43/46 (the onboard ES8311) and
+// never touch these pins, so the two paths can't collide. Initialized once
+// at boot regardless of the setting, so flipping the setting doesn't need a
+// reboot; only actually fed samples while External is selected -- see
+// AudioOutputM5Speaker::flush() below.
+static const int EXT_I2S_BCK = 5, EXT_I2S_WS = 6, EXT_I2S_DOUT = 3;
+static bool extI2sReady = false;
+static uint32_t extI2sRate = 44100;   // reconfigured on the fly to match hertz -- see flush() below
+
+static void initExtI2S() {
+    i2s_config_t cfg = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = 44100,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 256,
+        .use_apll = true,   // the default PLL/divider isn't precise for 44.1kHz-family rates -- audible as a slight speed/pitch offset
+        .tx_desc_auto_clear = true,
+    };
+    extI2sReady = (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) == ESP_OK);
+    if (extI2sReady) {
+        i2s_pin_config_t pins = {
+            .bck_io_num = EXT_I2S_BCK,
+            .ws_io_num = EXT_I2S_WS,
+            .data_out_num = EXT_I2S_DOUT,
+            .data_in_num = I2S_PIN_NO_CHANGE,
+        };
+        extI2sReady = (i2s_set_pin(I2S_NUM_0, &pins) == ESP_OK);
+    }
+    if (!extI2sReady) Serial.println("external I2S DAC init failed");
+}
+
 // ---------- Custom AudioOutput: triple-buffered feed to ES8311 via M5 Speaker ----------
 class AudioOutputM5Speaker : public AudioOutput {
 public:
@@ -423,15 +474,58 @@ public:
     void flush() override {
         if (_tri_buffer_index) {
             // Snapshot the tail of this chunk for the full-screen visualizer
-            // before playRaw() hands the buffer off -- last VISRAW_FRAMES
+            // before the buffer is consumed below -- last VISRAW_FRAMES
             // stereo frames (or fewer, zero-padded, if the chunk was short,
-            // e.g. right before a track ends).
+            // e.g. right before a track ends). Unaffected by the volume
+            // scaling below (that happens after this, only on the external
+            // path), matching the mono meter's own existing behavior of not
+            // accounting for volume either.
             size_t want = (size_t)VISRAW_FRAMES * 2;
             size_t n = _tri_buffer_index < want ? _tri_buffer_index : want;
             if (n < want) memset(visRawBuf, 0, (want - n) * sizeof(int16_t));
             memcpy(visRawBuf + (want - n), _tri_buffer[_tri_index] + (_tri_buffer_index - n), n * sizeof(int16_t));
 
-            _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch);
+            if (settingAudioOutput == AUDIO_OUT_EXTERNAL && extI2sReady) {
+                // Match the decoder's actual detected rate for this file --
+                // it's not always 44100 (that was only ever this path's
+                // boot-time default), and the internal path already gets
+                // this right by passing hertz into playRaw() below on every
+                // call. Only reconfigure when it actually changes; this can
+                // run every flush() call otherwise.
+                if (hertz != extI2sRate && hertz > 0) {
+                    i2s_set_sample_rates(I2S_NUM_0, hertz);
+                    extI2sRate = hertz;
+                }
+                // The DAC has no volume control of its own -- scale the
+                // samples by the same volume (0..255) the internal path's
+                // setVolume() uses, so switching outputs doesn't also jump
+                // the loudness.
+                int16_t *buf = _tri_buffer[_tri_index];
+                size_t count = _tri_buffer_index;
+                float g = volume / 255.0f;
+                for (size_t i = 0; i < count; i++) buf[i] = (int16_t)(buf[i] * g);
+                // i2s_write() can return having written less than asked --
+                // the DMA queue (~46ms deep) frequently can't drain a whole
+                // ~23ms chunk inside a short timeout, and a partial write
+                // silently drops the unwritten tail. That's not a quieter
+                // glitch, it's lost audio -- heard as the track racing ahead
+                // (samples skipped, not slowed/stretched). So this loops
+                // until the whole chunk is actually written, bounded by an
+                // overall deadline (not portMAX_DELAY) so a truly stuck DMA
+                // can't stall loop() forever -- just much longer than any
+                // single write should ever need in normal operation.
+                size_t totalBytes = count * sizeof(int16_t);
+                size_t offset = 0;
+                uint32_t deadline = millis() + 100;
+                while (offset < totalBytes && millis() < deadline) {
+                    size_t written = 0;
+                    i2s_write(I2S_NUM_0, (uint8_t*)buf + offset, totalBytes - offset, &written, pdMS_TO_TICKS(20));
+                    if (written == 0) break;
+                    offset += written;
+                }
+            } else {
+                _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch);
+            }
             _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
             _tri_buffer_index = 0;
         }
@@ -1645,13 +1739,14 @@ static void drawSettingsBox() {
     d.setCursor(boxX + 6, boxY + (titleH - d.fontHeight()) / 2);
     d.print("Settings");
 
-    const char* names[SETTINGS_COUNT]  = { "Backlight", "Screen off", "Album end", "Theme", "Screenshots" };
+    const char* names[SETTINGS_COUNT]  = { "Backlight", "Screen off", "Album end", "Theme", "Screenshots", "Audio output" };
     String values[SETTINGS_COUNT] = {
         backlightLabels[settingBacklightIdx],
         screenOffLabels[settingScreenOffIdx],
         albumEndLabels[albumEndMode],
         themeLabelAt(settingThemeIdx),
         onOffLabels[settingScreenshotsEnabled ? 1 : 0],
+        audioOutputLabels[settingAudioOutput],
     };
     for (int row = 0; row < SETTINGS_VISIBLE; row++) {
         int i = settingsScroll + row;
@@ -1725,6 +1820,9 @@ static void cycleSetting(int idx) {
             return;
         case 4:
             settingScreenshotsEnabled = !settingScreenshotsEnabled;
+            break;
+        case 5:
+            settingAudioOutput = (AudioOutputMode)((settingAudioOutput + 1) % AUDIO_OUT_MODE_COUNT);
             break;
     }
     saveSettings();
@@ -2414,6 +2512,7 @@ void setup() {
     M5Cardputer.Speaker.config(spk_cfg);
     M5Cardputer.Speaker.begin();
     M5Cardputer.Speaker.setVolume(volume);
+    initExtI2S();   // second, independent I2S peripheral -- see the comment above its definition
 
     auto &d = M5Cardputer.Display;
     d.setRotation(1);
