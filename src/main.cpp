@@ -33,17 +33,31 @@ static const char KEY_FULLVIS = 'v';      // Now Playing only: toggle full-scree
 static const char KEY_SCREENSHOT = 'c';   // any screen: save a BMP to SD; hold to burst-capture
 // ENTER also opens/plays; backtick ` also goes back; SPACE = pause/resume
 
-// ---------- Directory model (all static, no heap) ----------
-static const int MAX_ENTRIES = 256, NAME_POOL_SIZE = 8192, MAX_DEPTH = 8, MY_PATH_MAX = 256;
+// ---------- Directory model: one page at a time (all static, no heap) ----------
+// A folder is browsed one bounded PAGE_SIZE-entry page at a time instead of being
+// read into memory all at once -- a folder with thousands of files used to be
+// silently truncated to the first MAX_ENTRIES (256) entries encountered in raw
+// filesystem order (not even alphabetized), with no indication anything was
+// missing. Paging keeps memory and per-load work bounded to PAGE_SIZE regardless
+// of folder size, while still visiting (and correctly sorting) every entry across
+// pages. See loadPageFromThreshold()/loadNextPage()/loadPrevPage() below.
+static const int PAGE_SIZE = 64, NAME_POOL_SIZE = 8192, MAX_DEPTH = 8, MY_PATH_MAX = 256;
+static const int MAX_NAME_LEN = 128;    // cap on a single filename kept as a page threshold
+static const int MAX_PAGE_DEPTH = 64;   // remembered page thresholds per folder (64*PAGE_SIZE = 4096 entries deep)
 static char     namePool[NAME_POOL_SIZE];
-static uint16_t nameOffset[MAX_ENTRIES];
-static bool     entryIsDir[MAX_ENTRIES];
-static int      sortIdx[MAX_ENTRIES];         // alphabetized view into entries
-static int      entryCount = 0, poolUsed = 0;
+static uint16_t nameOffset[PAGE_SIZE];  // entries are stored already in sorted (folders-first, then name) order
+static bool     entryIsDir[PAGE_SIZE];
+static int      entryCount = 0, poolUsed = 0;   // entries on the CURRENT page only
+
+static int      pageIndex = 0;          // 0-based page within currentPath
+static bool     pageHasMore = false;    // true if another page exists after this one
+static char     pageThreshName[MAX_PAGE_DEPTH][MAX_NAME_LEN];  // last entry's name on page[i]
+static bool     pageThreshIsDir[MAX_PAGE_DEPTH];                // ...and whether it was a folder
 
 static char currentPath[MY_PATH_MAX] = "/";
 static int  cursor = 0, scroll = 0, depth = 0;
 static int  cursorStack[MAX_DEPTH], scrollStack[MAX_DEPTH];
+static int  pageStack[MAX_DEPTH];       // page index to restore per folder-stack depth
 
 // ---------- Play queue (the album that's currently playing) ----------
 static const int QUEUE_MAX = 256, QNAME_POOL = 8192;
@@ -907,56 +921,103 @@ static int nameCmp(const char* a, const char* b) {
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
 }
 
-static const char* entryName(int i) { return &namePool[nameOffset[i]]; }        // raw entry
-static const char* nameAt(int i)    { return &namePool[nameOffset[sortIdx[i]]]; } // sorted view
-static bool isDirAt(int i)          { return entryIsDir[sortIdx[i]]; }
+static const char* entryName(int i) { return &namePool[nameOffset[i]]; }   // already sorted -- see below
+static bool isDirAt(int i)          { return entryIsDir[i]; }
 
-// insertion sort on sortIdx (folders first, then files, each alphabetized)
-static void sortEntries() {
-    for (int i = 0; i < entryCount; i++) sortIdx[i] = i;
-    for (int i = 1; i < entryCount; i++) {
-        int key = sortIdx[i], j = i - 1;
-        while (j >= 0) {
-            int a = sortIdx[j];
-            // folders before files
-            bool swap;
-            if (entryIsDir[a] != entryIsDir[key]) swap = (!entryIsDir[a] && entryIsDir[key]);
-            else swap = (nameCmp(entryName(a), entryName(key)) > 0);
-            if (!swap) break;
-            sortIdx[j + 1] = sortIdx[j];
-            j--;
-        }
-        sortIdx[j + 1] = key;
-    }
+// True if (nameA,isDirA) sorts strictly after (nameB,isDirB): folders before
+// files, then natural-sorted name. Same ordering sortEntries() used to apply
+// after the fact; now applied as entries are inserted, one page at a time.
+static bool entryAfter(const char* nameA, bool isDirA, const char* nameB, bool isDirB) {
+    if (isDirA != isDirB) return isDirB;   // A after B iff B is the one that's a folder
+    return nameCmp(nameA, nameB) > 0;
 }
 
-// ---------- Directory load ----------
-static bool loadDir() {
-    entryCount = 0; poolUsed = 0;
+// Inserts (nm,isDir) into the current page's sorted array if it belongs there,
+// evicting the current last entry when the page is already full and this entry
+// ranks before it. Sets pageHasMore whenever an entry doesn't make the cut --
+// that's how "is there a next page" is known without a separate counting pass.
+static void insertPageEntry(const char* nm, int len, bool isDir) {
+    int insertAt = entryCount;
+    while (insertAt > 0 && entryAfter(&namePool[nameOffset[insertAt - 1]], entryIsDir[insertAt - 1], nm, isDir))
+        insertAt--;
+    if (insertAt >= PAGE_SIZE) { pageHasMore = true; return; }   // ranks after everything we're keeping
+    if (entryCount >= PAGE_SIZE) pageHasMore = true;             // full: this insert evicts the old last entry
+    if (poolUsed + len + 1 >= NAME_POOL_SIZE) return;            // pool exhausted (pathological names) -- drop
+    uint16_t off = poolUsed;
+    memcpy(&namePool[poolUsed], nm, len + 1);
+    poolUsed += len + 1;
+    int last = (entryCount < PAGE_SIZE) ? entryCount : PAGE_SIZE - 1;
+    for (int k = last; k > insertAt; k--) {
+        nameOffset[k] = nameOffset[k - 1];
+        entryIsDir[k] = entryIsDir[k - 1];
+    }
+    nameOffset[insertAt] = off;
+    entryIsDir[insertAt] = isDir;
+    if (entryCount < PAGE_SIZE) entryCount++;
+}
+
+// ---------- Directory load: one page, starting strictly after a threshold ----------
+// thresholdValid=false means "start from the beginning" (page 0). A single
+// directory walk; per-entry cost is a small bounded insertion (PAGE_SIZE deep at
+// most), so total work stays cheap regardless of how many files are in the
+// folder -- unlike the old single-pass-into-one-fixed-array approach, an
+// oversized folder no longer risks a long, unbounded, unyielding SD scan.
+static bool loadPageFromThreshold(bool thresholdValid, const char* threshName, bool threshIsDir) {
+    entryCount = 0; poolUsed = 0; pageHasMore = false;
     File dir = SD.open(currentPath);
     if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return false; }
     File e = dir.openNextFile();
-    while (e && entryCount < MAX_ENTRIES) {
+    while (e) {
         const char* nm = baseName(e.name());
-        int len = strlen(nm);
-        if (nm[0] != '.' && (poolUsed + len + 1) < NAME_POOL_SIZE) {
-            bool isDir = e.isDirectory();
-            if (isDir || isAudioFile(nm)) {
-                nameOffset[entryCount] = poolUsed;
-                entryIsDir[entryCount] = isDir;
-                memcpy(&namePool[poolUsed], nm, len + 1);
-                poolUsed += len + 1;
-                entryCount++;
-            }
+        bool isDir = e.isDirectory();
+        if (nm[0] != '.' && (isDir || isAudioFile(nm))) {
+            if (!thresholdValid || entryAfter(nm, isDir, threshName, threshIsDir))
+                insertPageEntry(nm, strlen(nm), isDir);
         }
         e.close();
         e = dir.openNextFile();
     }
     if (e) e.close();
     dir.close();
-    sortEntries();
     cursor = 0; scroll = 0;
     return true;
+}
+
+// Remembers the current page's last entry as page[pageIndex]'s threshold (the
+// boundary the next page must start strictly after).
+static void recordPageThreshold() {
+    if (entryCount == 0 || pageIndex >= MAX_PAGE_DEPTH) return;
+    strncpy(pageThreshName[pageIndex], &namePool[nameOffset[entryCount - 1]], MAX_NAME_LEN - 1);
+    pageThreshName[pageIndex][MAX_NAME_LEN - 1] = '\0';
+    pageThreshIsDir[pageIndex] = entryIsDir[entryCount - 1];
+}
+
+// Loads page 0 of currentPath fresh (entering a folder, or refreshing it).
+static bool loadDir() {
+    pageIndex = 0;
+    bool ok = loadPageFromThreshold(false, "", false);
+    if (ok) recordPageThreshold();
+    return ok;
+}
+
+// Advances to the next page, if one exists. No-op (returns false) if this is
+// already the last page, or we've hit the remembered-threshold depth limit.
+static bool loadNextPage() {
+    if (!pageHasMore || pageIndex + 1 >= MAX_PAGE_DEPTH) return false;
+    if (!loadPageFromThreshold(true, pageThreshName[pageIndex], pageThreshIsDir[pageIndex])) return false;
+    pageIndex++;
+    recordPageThreshold();
+    return true;
+}
+
+// Goes back to the previous page. No-op on page 0. Re-scans from that page's
+// own threshold rather than caching page content -- still one bounded scan.
+static bool loadPrevPage() {
+    if (pageIndex == 0) return false;
+    pageIndex--;
+    bool thresholdValid = pageIndex > 0;
+    return loadPageFromThreshold(thresholdValid, thresholdValid ? pageThreshName[pageIndex - 1] : "",
+                                  thresholdValid ? pageThreshIsDir[pageIndex - 1] : false);
 }
 
 // ---------- Play queue: snapshot a folder's tracks (alphabetized) ----------
@@ -1251,8 +1312,8 @@ static void togglePause() {
 // ---------- Browser navigation ----------
 static void enterFolder(int viewIdx) {
     if (depth >= MAX_DEPTH - 1) return;
-    cursorStack[depth] = cursor; scrollStack[depth] = scroll;
-    const char* nm = nameAt(viewIdx);
+    cursorStack[depth] = cursor; scrollStack[depth] = scroll; pageStack[depth] = pageIndex;
+    const char* nm = entryName(viewIdx);
     if (strcmp(currentPath, "/") == 0) snprintf(currentPath, MY_PATH_MAX, "/%s", nm);
     else { int L = strlen(currentPath); snprintf(currentPath + L, MY_PATH_MAX - L, "/%s", nm); }
     depth++;
@@ -1275,6 +1336,11 @@ static void goBack() {
     else if (s) *s = '\0';
     depth--;
     loadDir();
+    // Page content isn't cached across folder changes (only thresholds are, and
+    // those get overwritten by whatever folder was entered in between) -- walk
+    // forward again to the page we were on. Bounded, cheap: at most a handful
+    // of extra scans, same per-page cost as any other page load.
+    for (int i = 0; i < pageStack[depth] && loadNextPage(); i++) {}
     cursor = cursorStack[depth]; scroll = scrollStack[depth];
     if (cursor >= entryCount) cursor = entryCount ? entryCount - 1 : 0;
     needsRedraw = true;
@@ -1287,7 +1353,7 @@ static void openSelected() {
     if (isDirAt(cursor)) { enterFolder(cursor); return; }
 
     buildQueue(currentPath);
-    const char* sel = nameAt(cursor);
+    const char* sel = entryName(cursor);
     int startPos = 0;
     for (int i = 0; i < queueCount; i++) {
         if (strcmp(queueName(i), sel) == 0) { startPos = i; break; }
@@ -1303,18 +1369,27 @@ static void drawBrowserRow(int idx);   // defined below, in the drawing section
 // row) on every single keypress was visibly flashing and stealing enough loop()
 // time to cause an audible audio hiccup. If the cursor moved without scrolling
 // the viewport, only the two rows that actually changed need to be touched.
+// Moving past either end of the current page turns the page automatically
+// (previous page's last entry / next page's first entry) rather than wrapping
+// within the page -- existing keys, no new controls, one continuous list.
 static void moveCursor(int delta) {
     if (entryCount == 0) return;
     int oldCursor = cursor;
     int oldScroll = scroll;
+    bool turnedPage = false;
     cursor += delta;
-    if (cursor < 0) cursor = entryCount - 1;         // wrap: up past the top -> last entry
-    if (cursor >= entryCount) cursor = 0;             // wrap: down past the bottom -> first entry
+    if (cursor < 0) {
+        if (pageIndex > 0 && loadPrevPage()) turnedPage = true;
+        cursor = entryCount ? entryCount - 1 : 0;   // wrap to last entry (page 0, or loadPrevPage failed)
+    } else if (cursor >= entryCount) {
+        if (pageHasMore && loadNextPage()) { cursor = 0; turnedPage = true; }
+        else cursor = 0;                      // last page: wrap to first entry, as before
+    }
     if (cursor < scroll) scroll = cursor;
     if (cursor >= scroll + visibleRows) scroll = cursor - visibleRows + 1;
 
-    if (scroll != oldScroll) {
-        needsRedraw = true;             // viewport shifted -- every row's content changed
+    if (turnedPage || scroll != oldScroll) {
+        needsRedraw = true;             // page or viewport changed -- every row's content changed
     } else if (cursor != oldCursor) {
         drawBrowserRow(oldCursor);
         drawBrowserRow(cursor);
@@ -1578,7 +1653,7 @@ static void drawBrowserRow(int idx) {
         drawFolderIcon(d, 6, y + (ROW_H - FOLDER_ICON_H) / 2, fg);
         textX = 6 + FOLDER_ICON_W + 5;
     }
-    String text = selectBrowserFont(d, nameAt(idx));
+    String text = selectBrowserFont(d, entryName(idx));
     int availW = d.width() - textX - 4;
     d.setCursor(textX, y + (ROW_H - d.fontHeight()) / 2);
     d.print(trimToWidth(d, text, availW));
@@ -1588,10 +1663,14 @@ static void drawBrowserRow(int idx) {
 // bare slash. Kept ASCII-only (no chevron/arrow glyph) since glyph coverage
 // for anything fancier isn't guaranteed across every font a theme might pick.
 static String breadcrumb() {
-    if (depth == 0) return "Library";
-    String s(currentPath);
-    if (s.startsWith("/")) s.remove(0, 1);
-    s.replace("/", "  /  ");
+    String s = (depth == 0) ? "Library" : currentPath;
+    if (depth > 0) {
+        if (s.startsWith("/")) s.remove(0, 1);
+        s.replace("/", "  /  ");
+    }
+    // Only ever shows up for a folder with more than PAGE_SIZE entries --
+    // invisible for the common case, same as today.
+    if (pageIndex > 0 || pageHasMore) s += "  (pg " + String(pageIndex + 1) + ")";
     return s;
 }
 
