@@ -1,0 +1,8 @@
+# EMBER -- WiFi
+# Copy this file to the root of the SD card as: wifi.txt
+#
+# Line 1: network name (SSID)
+# Line 2: password
+# Lines starting with '#' and blank lines are ignored.
+MyWiFiNetwork
+my_password
