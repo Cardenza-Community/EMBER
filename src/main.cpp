@@ -30,6 +30,7 @@ static const char KEY_NOWPLAYING = 'm';
 static const char KEY_SETTINGS = 's';
 static const char KEY_ART_TOGGLE = 'a';   // Now Playing only: force turntable vs real art
 static const char KEY_FULLVIS = 'v';      // Now Playing only: toggle full-screen visualizer
+static const char KEY_VIS_STYLE = 'z';    // Now Playing only: cycle the small visualizer's style
 static const char KEY_SCREENSHOT = 'c';   // any screen: save a BMP to SD; hold to burst-capture
 // ENTER also opens/plays; backtick ` also goes back; SPACE = pause/resume
 
@@ -459,6 +460,19 @@ static void pushVisLevel(float level, float bassRatio) {
     visBassRatio[VIS_HISTORY - 1] = bassRatio;
 }
 
+// Per-channel (L/R) levels for the Channels visualizer style -- same chunk
+// cadence as pushVisLevel, fed from AudioOutputM5Speaker::flush().
+static float visHistL[VIS_HISTORY] = {0};
+static float visHistR[VIS_HISTORY] = {0};
+static void pushVisStereo(float l, float r) {
+    for (int i = 0; i < VIS_HISTORY - 1; i++) {
+        visHistL[i] = visHistL[i + 1];
+        visHistR[i] = visHistR[i + 1];
+    }
+    visHistL[VIS_HISTORY - 1] = l;
+    visHistR[VIS_HISTORY - 1] = r;
+}
+
 // Raw stereo PCM snapshot for the full-screen FFT visualizer (see fft_t /
 // drawFullVis below) -- separate from the amplitude-history path above,
 // which only keeps a per-chunk scalar and throws the samples away. Captured
@@ -483,6 +497,8 @@ public:
             _tri_buffer[_tri_index][_tri_buffer_index+1] = sample[1];
             _tri_buffer_index += 2;
             _visSum += abs((int)sample[0]) + abs((int)sample[1]);
+            _visSumL += abs((int)sample[0]);
+            _visSumR += abs((int)sample[1]);
             _visCount += 2;
 
             // Cheap bass/treble split (no FFT): a one-pole low-pass filter tracks
@@ -528,7 +544,17 @@ public:
 
             pushVisLevel(boosted, bassRatio);
             lastBassEnvelope = (_visBassSum / (_visCount / 2)) / 32768.0f;
+
+            float rawL = (float)_visSumL / (_visCount / 2) / 32768.0f;
+            float boostL = sqrtf(rawL * 2.0f);
+            if (boostL > 1.0f) boostL = 1.0f;
+            float rawR = (float)_visSumR / (_visCount / 2) / 32768.0f;
+            float boostR = sqrtf(rawR * 2.0f);
+            if (boostR > 1.0f) boostR = 1.0f;
+            pushVisStereo(boostL, boostR);
+
             _visSum = 0; _visCount = 0;
+            _visSumL = 0; _visSumR = 0;
             _visBassSum = 0.0f; _visTrebleSum = 0.0f;
         }
     }
@@ -540,6 +566,7 @@ protected:
     int16_t _tri_buffer[3][tri_buf_size];
     size_t _tri_buffer_index = 0, _tri_index = 0;
     uint32_t _visSum = 0, _visCount = 0;
+    uint32_t _visSumL = 0, _visSumR = 0;
     float _bassLP = 0.0f;
     float _visBassSum = 0.0f, _visTrebleSum = 0.0f;
 };
@@ -1989,10 +2016,22 @@ static int visLeft = 0, visTop = 0;
 static const int VIS_SEG_H = 4, VIS_SEG_GAP = 1;
 static const int VIS_SEG_COUNT = VIS_MAX_H / (VIS_SEG_H + VIS_SEG_GAP);
 
+// ---------- Now Playing visualizer: selectable styles (key 'z' cycles) ----------
+// Ported from mr-f0xx's now-deleted EMBER fork (preserved locally, see
+// Documents/PlatformIO/Projects/Mp3ADV-mrfoxx) -- only the 5 styles that read
+// as correct on inspection; Spectrum (runs a full FFT every ~60ms redraw, an
+// unthrottled cost the full-screen spectrum visualizer explicitly avoids) and
+// Wave (a latent out-of-bounds read if the sprite ever got wider than the raw
+// sample buffer) were left out. Not yet wired into Settings/persisted -- 'z'
+// just cycles for the session, same as the art-toggle/full-vis keys.
+enum VisStyle { VS_BARS, VS_PEAKS, VS_MIRROR, VIS_STYLE_COUNT };
+static const char* visStyleLabels[VIS_STYLE_COUNT] = { "Bars", "Peaks", "Mirror" };
+static VisStyle settingVisStyle = VS_BARS;
+static uint32_t visStyleLabelUntil = 0;   // millis() deadline; drawVisualizer() overlays the name until then
+
 // Bars are bottom-anchored and grow upward (taller = louder), like a classic
 // hardware EQ display, not top-down.
-static void drawVisualizer() {
-    if (!visSpriteOk) return;
+static void drawVisBars() {
     visSprite->fillSprite(COL_NP_BG);
     for (int i = 0; i < VIS_BARS; i++) {
         float lvl = visHistory[i];
@@ -2011,6 +2050,72 @@ static void drawVisualizer() {
             uint16_t litColor = tier <= 0.6f ? COL_PLAY : tier <= 0.85f ? COL_VIS_MID : COL_VIS_HIGH;
             visSprite->fillRect(bx, y, VIS_BAR_W, VIS_SEG_H, lit ? litColor : COL_VIS_IDLE);
         }
+    }
+}
+
+// Solid bars with a falling peak-hold marker, like a modern desktop EQ.
+static float visPeaks[VIS_BARS] = {0};
+static void drawVisPeaks() {
+    int h = VIS_MAX_H;
+    visSprite->fillSprite(COL_NP_BG);
+    for (int i = 0; i < VIS_BARS; i++) {
+        float lvl = visHistory[i];
+        if (lvl < 0.0f) lvl = 0.0f;
+        if (lvl > 1.0f) lvl = 1.0f;
+        int barH = (int)(lvl * h);
+        if (barH < 1) barH = 1;
+        int bx = i * (VIS_BAR_W + VIS_BAR_GAP);
+        float tier = (float)(i + 1) / VIS_BARS;
+        uint16_t col = tier <= 0.6f ? COL_PLAY : tier <= 0.85f ? COL_VIS_MID : COL_VIS_HIGH;
+
+        // Fast attack, slower release: the peak snaps up instantly and falls
+        // back gently.
+        if (barH > visPeaks[i]) visPeaks[i] = barH;
+        else if (visPeaks[i] > 1.0f) visPeaks[i] -= 0.45f;
+
+        visSprite->fillRect(bx, h - barH, VIS_BAR_W, barH, col);
+        int py = h - (int)visPeaks[i];
+        if (py < 0) py = 0;
+        visSprite->fillRect(bx, py, VIS_BAR_W, 1, COL_NP_TEXT);   // peak cap
+    }
+}
+
+// Symmetric bars growing out of a center axis, like a mastering EQ.
+static void drawVisMirror() {
+    int h = VIS_MAX_H;
+    int mid = h / 2;
+    visSprite->fillSprite(COL_NP_BG);
+    visSprite->drawFastHLine(0, mid, visSprite->width(), COL_VIS_IDLE);
+    for (int i = 0; i < VIS_BARS; i++) {
+        float lvl = visHistory[i];
+        if (lvl < 0.0f) lvl = 0.0f;
+        if (lvl > 1.0f) lvl = 1.0f;
+        int half = (int)(lvl * (h / 2 - 1));
+        if (half < 1) half = 1;
+        int bx = i * (VIS_BAR_W + VIS_BAR_GAP);
+        float tier = (float)(i + 1) / VIS_BARS;
+        uint16_t col = tier <= 0.6f ? COL_PLAY : tier <= 0.85f ? COL_VIS_MID : COL_VIS_HIGH;
+        visSprite->fillRect(bx, mid - half, VIS_BAR_W, half * 2, col);
+    }
+}
+
+static void drawVisualizer() {
+    if (!visSpriteOk) return;
+    switch (settingVisStyle) {
+        case VS_PEAKS:    drawVisPeaks();    break;
+        case VS_MIRROR:   drawVisMirror();   break;
+        default:          drawVisBars();     break;
+    }
+    if (millis() < visStyleLabelUntil) {
+        const char* label = visStyleLabels[settingVisStyle];
+        visSprite->setFont(FONT_UI);
+        int tw = visSprite->textWidth(label);
+        int tx = (visSprite->width() - tw) / 2;
+        int ty = (VIS_MAX_H - visSprite->fontHeight()) / 2;
+        visSprite->fillRect(tx - 3, ty - 1, tw + 6, visSprite->fontHeight() + 2, COL_NP_BG);
+        visSprite->setTextColor(COL_NP_TEXT, COL_NP_BG);
+        visSprite->setCursor(tx, ty);
+        visSprite->print(label);
     }
     visSprite->pushSprite(visLeft, visTop);
 }
@@ -2720,6 +2825,10 @@ void loop() {
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_ART_TOGGLE) {
                     preferTurntable = !preferTurntable;
                     drawArtRegion();
+                } else if (uiMode == MODE_NOWPLAYING && c == KEY_VIS_STYLE) {
+                    settingVisStyle = (VisStyle)((settingVisStyle + 1) % VIS_STYLE_COUNT);
+                    visStyleLabelUntil = millis() + 1500;
+                    drawVisualizer();
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_OPEN) {
                     // "right arrow" -- seek forward, or skip to next track on a quick double-tap
                     unsigned long now = millis();
