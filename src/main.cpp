@@ -2123,9 +2123,7 @@ static const int VIS_SEG_COUNT = VIS_MAX_H / (VIS_SEG_H + VIS_SEG_GAP);
 // sample buffer) were left out. Not yet wired into Settings/persisted -- 'z'
 // just cycles for the session, same as the art-toggle/full-vis keys.
 enum VisStyle { VS_BARS, VS_PEAKS, VS_MIRROR, VIS_STYLE_COUNT };
-static const char* visStyleLabels[VIS_STYLE_COUNT] = { "Bars", "Peaks", "Mirror" };
 static VisStyle settingVisStyle = VS_BARS;
-static uint32_t visStyleLabelUntil = 0;   // millis() deadline; drawVisualizer() overlays the name until then
 
 // Bars are bottom-anchored and grow upward (taller = louder), like a classic
 // hardware EQ display, not top-down.
@@ -2203,17 +2201,6 @@ static void drawVisualizer() {
         case VS_PEAKS:    drawVisPeaks();    break;
         case VS_MIRROR:   drawVisMirror();   break;
         default:          drawVisBars();     break;
-    }
-    if (millis() < visStyleLabelUntil) {
-        const char* label = visStyleLabels[settingVisStyle];
-        visSprite->setFont(FONT_UI);
-        int tw = visSprite->textWidth(label);
-        int tx = (visSprite->width() - tw) / 2;
-        int ty = (VIS_MAX_H - visSprite->fontHeight()) / 2;
-        visSprite->fillRect(tx - 3, ty - 1, tw + 6, visSprite->fontHeight() + 2, COL_NP_BG);
-        visSprite->setTextColor(COL_NP_TEXT, COL_NP_BG);
-        visSprite->setCursor(tx, ty);
-        visSprite->print(label);
     }
     visSprite->pushSprite(visLeft, visTop);
 }
@@ -2926,7 +2913,6 @@ void loop() {
                     drawArtRegion();
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_VIS_STYLE) {
                     settingVisStyle = (VisStyle)((settingVisStyle + 1) % VIS_STYLE_COUNT);
-                    visStyleLabelUntil = millis() + 1500;
                     drawVisualizer();
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_OPEN) {
                     // "right arrow" -- seek forward, or skip to next track on a quick double-tap
