@@ -259,12 +259,34 @@ static const Theme THEME_AMBER = {
     rgb565(40, 28, 0),         // visIdle      #281c00
 };
 
+// "iPuter" -- classic click-wheel-era iPod look: white body, black text, a
+// blue banner/selection accent. Exact palette from the user's own
+// browser-based theme editor (tools/theme-editor.html), not hand-guessed.
+static const Theme THEME_IPUTER = {
+    rgb565(237, 237, 237),// bg          -- browser screen background
+    rgb565(197, 199, 201),// header      -- top bar fill + settings box fill
+    rgb565(0, 0, 0),      // headerText  -- title text on the header bar
+    rgb565(0, 0, 0),      // folder      -- folder rows in the browser list
+    rgb565(0, 0, 0),      // file        -- track rows in the browser list
+    rgb565(47, 148, 232), // selBg       -- highlighted row pill background
+    rgb565(255, 244, 230),// selFg       -- text on the highlighted row
+    rgb565(89, 89, 89),   // dim         -- empty-folder note, title/album lines, progress line
+    rgb565(40, 148, 232), // play        -- amplitude bars, bottom ~60% of each column
+    rgb565(0, 0, 0),      // npText      -- the bright top line (artist name)
+    rgb565(0, 0, 0),      // volumeIcon  -- speaker glyph + lit bars
+    rgb565(47, 148, 232), // progressDot -- scrub-position marker on the progress line
+    rgb565(95, 175, 236), // visMid      -- amplitude bars, ~60-85% of each column
+    rgb565(157, 199, 231),// visHigh     -- amplitude bars, top ~15% of each column
+    rgb565(237, 237, 237),// npBg        -- Now Playing's own background (independent of Browser)
+    rgb565(197, 199, 201),// visIdle     -- unlit segments when there's no sound
+};
+
 // All available themes, cycled from Settings -> Theme; Ember is always the
 // default at boot (index 0), regardless of what's added after it.
 static const Theme* const THEME_LIST[] = { &THEME_EMBER, &THEME_90S_SWEATER, &THEME_AQUA, &THEME_HONEY, &THEME_MOODY, &THEME_TERMINAL_GREEN,
-    &THEME_TOKYO_NIGHT, &THEME_AMBER };
+    &THEME_TOKYO_NIGHT, &THEME_AMBER, &THEME_IPUTER };
 static const char* THEME_LABELS[] = { "Ember", "90's Sweater", "Aqua", "Honey", "Moody", "Terminal Green",
-    "Tokyo Night", "Amber on Black" };
+    "Tokyo Night", "Amber on Black", "iPuter" };
 static const int THEME_COUNT = sizeof(THEME_LIST) / sizeof(THEME_LIST[0]);
 
 // User themes loaded from /themes/*.json on SD at boot (see loadCustomThemes()
