@@ -1909,14 +1909,14 @@ static void drawSettingsBox() {
     d.setCursor(boxX + 6, boxY + (titleH - d.fontHeight()) / 2);
     d.print("Settings");
 
-    const char* names[SETTINGS_COUNT]  = { "Backlight", "Screen off", "Album end", "Theme", "Screenshots", "Audio output" };
+    const char* names[SETTINGS_COUNT]  = { "Backlight", "Screen off", "Album end", "Screenshots", "Audio output", "Theme" };
     String values[SETTINGS_COUNT] = {
         backlightLabels[settingBacklightIdx],
         screenOffLabels[settingScreenOffIdx],
         albumEndLabels[albumEndMode],
-        themeLabelAt(settingThemeIdx),
         onOffLabels[settingScreenshotsEnabled ? 1 : 0],
         audioOutputLabels[settingAudioOutput],
+        themeLabelAt(settingThemeIdx),
     };
     for (int row = 0; row < SETTINGS_VISIBLE; row++) {
         int i = settingsScroll + row;
@@ -1983,17 +1983,17 @@ static void cycleSetting(int idx) {
             albumEndMode = (AlbumEndMode)((albumEndMode + 1) % ALBUM_END_MODE_COUNT);
             break;
         case 3:
+            settingScreenshotsEnabled = !settingScreenshotsEnabled;
+            break;
+        case 4:
+            settingAudioOutput = (AudioOutputMode)((settingAudioOutput + 1) % AUDIO_OUT_MODE_COUNT);
+            break;
+        case 5:
             settingThemeIdx = (settingThemeIdx + 1) % totalThemeCount();
             theme = themeAt(settingThemeIdx);
             saveSettings();
             drawSettings();
             return;
-        case 4:
-            settingScreenshotsEnabled = !settingScreenshotsEnabled;
-            break;
-        case 5:
-            settingAudioOutput = (AudioOutputMode)((settingAudioOutput + 1) % AUDIO_OUT_MODE_COUNT);
-            break;
     }
     saveSettings();
     drawSettingsBox();
