@@ -78,9 +78,11 @@ namespace net {
                   char* album, size_t albumSz,
                   char* title, size_t titleSz);
     String streamURL(int idx);                 // full stream.view URL with auth
+    String albumArtURL();                       // getCoverArt.view URL for the current album (auth baked in), or "" if the album has no art
     int  currentIndex();
     void setCurrent(int idx);
     void setCurrentInvalid();
+    const char* currentAlbumId();               // for caching art fetches by album in main.cpp
 }
 
 // Hardcoded fallbacks when the SD files are absent (empty = disabled).

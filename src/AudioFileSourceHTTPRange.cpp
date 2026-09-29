@@ -47,6 +47,15 @@ bool AudioFileSourceHTTPRange::connectRange(uint32_t start) {
         endClient();
         return false;
     }
+    // HTTPClient::header() only ever returns headers explicitly whitelisted
+    // here -- without this, both header() calls below silently return "" on
+    // every request, no error. That broke getSize() (parsed from
+    // Content-Range: seeking and the progress bar both depend on it) and
+    // getContentType() (drives FLAC/AAC vs MP3 decoder selection -- with an
+    // always-empty content type it silently fell back to MP3 for every
+    // format, never actually detecting FLAC/AAC at all).
+    static const char* kCollectedHeaders[] = { "Content-Type", "Content-Range" };
+    _http.collectHeaders(kCollectedHeaders, 2);
     char range[32];
     snprintf(range, sizeof(range), "bytes=%u-", (unsigned)start);
     _http.addHeader("Range", range);

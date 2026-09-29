@@ -46,6 +46,7 @@ static int  cursorMem[3] = {0, 0, 0};
 
 static char artistId[NET_ID_MAX] = "", artistName[NET_NAME_MAX] = "";
 static char albumId[NET_ID_MAX]  = "", albumName[NET_NAME_MAX]  = "";
+static char albumCoverArt[NET_ID_MAX] = "";   // <album coverArt="..">; empty when the album has no art
 
 static char srvBase[160] = "", srvUser[64] = "", srvPass[64] = "";
 
@@ -153,16 +154,12 @@ static bool connectWifi() {
     WiFi.disconnect(true);
     WiFi.begin(ssid, pass);
 
+    // Drawn once, not per-tick -- redrawing the whole frame (full-screen
+    // clear + header + icons) every ~150ms for the dot animation flashed
+    // visibly on this display with no double-buffering here.
+    drawBusyFrame("Connecting to WiFi", 0);
     uint32_t t0 = millis();
-    int dots = 0;
-    unsigned long lastDot = 0;
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-        unsigned long now = millis();
-        if (now - lastDot >= 150) {
-            lastDot = now;
-            dots = (dots + 1) % 4;
-            drawBusyFrame("Connecting to WiFi", dots);
-        }
         delay(20);
     }
     return WiFi.status() == WL_CONNECTED;
@@ -397,6 +394,12 @@ static bool loadSongs() {
     String body;
     int code = httpGetText(endpoint("getAlbum.view") + "&id=" + urlEncode(albumId), body);
     if (code != HTTP_CODE_OK) return false;
+    // The <album> element's own coverArt id -- a separate id namespace from
+    // the album's own id (same trap as getIndexes vs getArtists ids above),
+    // and what getCoverArt.view actually expects. Left empty when the album
+    // has no art at all.
+    if (!xmlAttr(body, "album", 0, "coverArt", albumCoverArt, sizeof(albumCoverArt)))
+        albumCoverArt[0] = 0;
     int n = xmlCount(body, "song");
     char id[NET_ID_MAX], title[NET_NAME_MAX];
     for (int i = 0; i < n && listCount < MAX_LIST; i++) {
@@ -502,13 +505,19 @@ void net::drawScreen() {
             d.setCursor(4, d.height() - p_.rowH * 2 - 2);
             d.print(footerRetry);
             break;
-        case NET_WIFI_FAIL:
-            drawCentered("WiFi connection failed", "check /wifi.txt");
+        case NET_WIFI_FAIL: {
+            // Same plain, high-contrast, single-block treatment as NET_ERROR.
             d.setFont(p_.fontUI);
             d.setTextColor(p_.fileFg, p_.bg);
-            d.setCursor(4, d.height() - p_.rowH * 2 - 2);
-            d.print(footerRetry);
+            const char* l1 = "WiFi connection failed.";
+            const char* l2 = "Check /wifi.txt on the SD card.";
+            int y = p_.headerH + (d.height() - p_.headerH) / 2 - d.fontHeight();
+            d.setCursor((d.width() - d.textWidth(l1)) / 2, y);
+            d.print(l1);
+            d.setCursor((d.width() - d.textWidth(l2)) / 2, y + d.fontHeight() + 6);
+            d.print(l2);
             break;
+        }
         case NET_AUTH_FAIL:
             drawCentered("Login rejected", "check /subsonic.txt");
             d.setFont(p_.fontUI);
@@ -519,13 +528,21 @@ void net::drawScreen() {
         case NET_NO_LIST:
             drawCentered("No music", "on this server");
             break;
-        case NET_ERROR:
-            drawCentered("Server error", "couldn't load");
+        case NET_ERROR: {
+            // Plain, high-contrast, single message -- the two-line dim
+            // drawCentered() + separate footer combo (still used by the
+            // states above) read as hard to parse for this one.
             d.setFont(p_.fontUI);
             d.setTextColor(p_.fileFg, p_.bg);
-            d.setCursor(4, d.height() - p_.rowH * 2 - 2);
-            d.print(footerRetry);
+            const char* l1 = "Server disconnected.";
+            const char* l2 = "Press ESC to go to main menu.";
+            int y = p_.headerH + (d.height() - p_.headerH) / 2 - d.fontHeight();
+            d.setCursor((d.width() - d.textWidth(l1)) / 2, y);
+            d.print(l1);
+            d.setCursor((d.width() - d.textWidth(l2)) / 2, y + d.fontHeight() + 6);
+            d.print(l2);
             break;
+        }
         default:
             if (listCount == 0) {
                 d.setFont(p_.fontBrowser);
@@ -585,6 +602,13 @@ static void openSelected() {
 void net::onEnter() {
     if (state_ == NET_ARTISTS || state_ == NET_ALBUMS || state_ == NET_SONGS) {
         openSelected();
+        // openSelected() updates state_/netLevel on success but never redraws
+        // itself -- without this the screen just sits on the old "Loading..."
+        // frame even though the new list already arrived. Only redraw here if
+        // we're still on the network screen, though: reaching the song level
+        // plays it and jumps to Now Playing, and redrawing the network screen
+        // on top of that would immediately overwrite it.
+        if (emb_uiIsNet()) drawScreen();
     } else {
         // error screen: retry the whole chain
         enter();
@@ -602,6 +626,7 @@ bool net::goBack() {
         else state_ = listCount ? NET_ALBUMS : NET_NO_LIST;
         cursor_ = cursorMem[1] < listCount ? cursorMem[1] : 0;
         scroll_ = 0;
+        drawScreen();   // same missing-redraw issue as openSelected() -- see net::onEnter()
         return false;
     } else if (netLevel == 1) {
         cursorMem[1] = cursor_;
@@ -612,6 +637,7 @@ bool net::goBack() {
         else state_ = listCount ? NET_ARTISTS : NET_NO_LIST;
         cursor_ = cursorMem[0] < listCount ? cursorMem[0] : 0;
         scroll_ = 0;
+        drawScreen();
         return false;
     }
     // already at the artist level: the caller exits network mode
@@ -653,7 +679,7 @@ void net::enter() {
     freeLists();
     message_[0] = 0;
     cursorMem[0] = cursorMem[1] = cursorMem[2] = 0;
-    artistId[0] = artistName[0] = albumId[0] = albumName[0] = 0;
+    artistId[0] = artistName[0] = albumId[0] = albumName[0] = albumCoverArt[0] = 0;
     netLevel = 0;
 
     if (!loadConfig()) { state_ = NET_CFG_FAIL; return; }
@@ -708,9 +734,18 @@ String net::streamURL(int idx) {
     return String(srvBase) + "/rest/stream.view?id=" + urlEncode(listIds[idx]) +
            "&" + authParams();
 }
+// size=200 asks the server to pre-scale (most Subsonic servers honor it,
+// cutting download/decode work); the client still fits to COVER_W x COVER_H
+// itself regardless, so a server that ignores the hint still works.
+String net::albumArtURL() {
+    if (!albumCoverArt[0]) return String();
+    return String(srvBase) + "/rest/getCoverArt.view?id=" + urlEncode(albumCoverArt) +
+           "&size=200&" + authParams();
+}
 int  net::currentIndex()        { return currentSong_; }
 void net::setCurrent(int idx)   { currentSong_ = idx; }
 void net::setCurrentInvalid()   { currentSong_ = -1; }
+const char* net::currentAlbumId() { return albumId; }
 
 void net::showMessage(const char* msg, uint32_t ttlMs) {
     strncpy(message_, msg, sizeof(message_) - 1);

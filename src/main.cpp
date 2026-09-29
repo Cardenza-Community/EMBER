@@ -14,6 +14,8 @@
 #include "AudioGeneratorAAC.h"
 #include "AudioOutput.h"
 #include "AudioFileSourceHTTPRange.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include "network.h"
 #include "ember_logo.h"
 #include "turntable_frames.h"
@@ -908,23 +910,52 @@ static void drawTurntableFrame() {
     turntableFrameIdx = (turntableFrameIdx + 1) % TURNTABLE_FRAME_COUNT;
 }
 
+// Same animation, but pushed straight to the display a row at a time instead
+// of into turntableSprite -- that sprite (~22KB) is deliberately not
+// resident during network mode (see freeArtSprites() below), and measured
+// free heap while actually streaming (~10-12KB) makes even this smaller
+// sprite an unreliable allocation there. A single 105-pixel row buffer (210
+// bytes) is cheap enough to keep on the stack instead. pushImage() with a
+// raw uint16_t array is a bulk copy straight onto the wire format, same as
+// writing into a sprite's raw buffer -- needs the same swap565 byte-swap as
+// drawTurntableFrame() above, or the theme colors come out wrong.
+static void drawTurntableFrameDirect() {
+    auto &d = M5Cardputer.Display;
+    uint16_t fg = (theme.file >> 8) | (theme.file << 8);
+    uint16_t bg = (theme.npBg >> 8) | (theme.npBg << 8);
+    const uint8_t* frame = &turntableFrames[turntableFrameIdx * TURNTABLE_BYTES_PER_FRAME];
+    uint16_t row[TURNTABLE_W];
+    for (int y = 0; y < TURNTABLE_H; y++) {
+        for (int x = 0; x < TURNTABLE_W; x++) {
+            int i = y * TURNTABLE_W + x;
+            bool on = (frame[i >> 3] >> (7 - (i & 7))) & 1;
+            row[x] = on ? fg : bg;
+        }
+        d.pushImage(COVER_X, COVER_Y + y, TURNTABLE_W, 1, row);
+    }
+    turntableFrameIdx = (turntableFrameIdx + 1) % TURNTABLE_FRAME_COUNT;
+}
+
 static void drawArtRegion();   // defined below; blits coverSprite to the screen
 
-// Called every loop() iteration; only animates (and only touches the
-// turntable sprite) while the turntable placeholder is actually the one
-// showing -- either because there's no real art, or preferTurntable forced it.
+// Called every loop() iteration; only animates while the turntable
+// placeholder is actually the one showing -- either because there's no real
+// art, or preferTurntable forced it (SD only -- KEY_ART_TOGGLE is a no-op in
+// network mode, so preferTurntable never applies there).
 // Also holds on the current frame while playback is paused/stopped, so the
 // "record" stops spinning right when the music does instead of running on
 // its own clock -- `last` is intentionally left untouched while paused, so
 // the animation resumes at the same 160ms cadence rather than jumping ahead.
 static void turntableTick() {
     static unsigned long last = 0;
-    if (uiMode != MODE_NOWPLAYING || !turntableSpriteOk) return;
+    if (uiMode != MODE_NOWPLAYING) return;
     if (coverHasArt && !preferTurntable) return;
     if (playState != PLAYING) return;
     unsigned long now = millis();
     if (now - last < 160) return;
     last = now;
+    if (netStream) { drawTurntableFrameDirect(); return; }
+    if (!turntableSpriteOk) return;
     drawTurntableFrame();
     drawArtRegion();
 }
@@ -1045,21 +1076,71 @@ static void loadAlbumArt(const char* path) {
     drawTurntableFrame();
 }
 
+// Remote album art (Subsonic/Gonic getCoverArt.view). No coverSprite here --
+// it (and turntableSprite) are freed for the whole time network mode is
+// active specifically to leave WiFi/HTTP enough heap (see freeArtSprites()
+// below) -- measured free heap while actually streaming was ~10-12KB, well
+// under even that sprite's own ~22KB alone. So this decodes straight onto
+// the display instead of into a sprite -- same "never buffer the whole
+// thing" principle AudioFileSourceHTTPRange already uses for audio; only the
+// JPEG/PNG decoder's own small internal block buffer is needed here, not a
+// frame-sized one.
+//
+// Runs fresh on every drawArtRegion() call rather than caching a decoded
+// copy (there's nowhere cheap to cache it to) -- acceptable since this only
+// fires on track changes and Now Playing redraws (e.g. after Settings), an
+// already-brief-stall-tolerant path, not the steady playback loop.
+static bool drawNetAlbumArt() {
+    String url = net::albumArtURL();
+    if (!url.length()) return false;
+
+    HTTPClient http;
+    WiFiClient plain;
+    WiFiClientSecure secure;
+    WiFiClient* client = &plain;
+    bool https = url.startsWith("https://");
+    if (https) { secure.setInsecure(); secure.setTimeout(8); client = &secure; }
+    else plain.setTimeout(8);
+    http.setTimeout(6000);
+    if (!http.begin(*client, url)) return false;
+
+    // Same HTTPClient::header() whitelisting gotcha fixed in
+    // AudioFileSourceHTTPRange::connectRange() -- collectHeaders() must be
+    // called before GET() or Content-Type always reads back empty.
+    static const char* kHeaders[] = { "Content-Type" };
+    http.collectHeaders(kHeaders, 1);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+    String ct = http.header("Content-Type");
+    bool isPng = ct.indexOf("png") >= 0;
+
+    WiFiClient* stream = http.getStreamPtr();
+    auto &d = M5Cardputer.Display;
+    // scale 0,0 => fit-to-box, same as loadAlbumArt()'s no-known-size case --
+    // there's no header to sniff image dimensions from mid-HTTP-stream.
+    bool ok = isPng ? d.drawPng(stream, COVER_X, COVER_Y, COVER_W, COVER_H, 0, 0, 0.0f, 0.0f)
+                     : d.drawJpg(stream, COVER_X, COVER_Y, COVER_W, COVER_H, 0, 0, 0.0f, 0.0f);
+    http.end();
+    return ok;
+}
+
 // SEAM: this is the only place the Now Playing screen paints the art box. Today it
 // blits the cached cover (or placeholder); a future audio visualizer can render live
 // here instead, without touching the loading/caching logic above.
 static void drawArtRegion() {
     if (netStream) {
-        // Remote playback: no cover art -- an intentional network placeholder
-        // (framed box + music note) instead of the turntable/art path.
         auto &d = M5Cardputer.Display;
         d.fillRect(COVER_X, COVER_Y, COVER_W, COVER_H, COL_NP_BG);
-        uint16_t c = COL_DIM;
-        d.drawRect(COVER_X + 10, COVER_Y + 10, COVER_W - 20, COVER_H - 20, c);
-        int cx = COVER_X + COVER_W / 2, cy = COVER_Y + COVER_H / 2;
-        d.fillCircle(cx - 7, cy + 4, 5, c);
-        d.fillRect(cx - 3, cy - 11, 3, 16, c);
-        d.fillRect(cx - 3, cy - 11, 10, 3, c);
+        // Real getCoverArt.view fetch is disabled for now -- it froze
+        // playback on at least one real album (the cover itself downloads
+        // fine via curl, so the hang is in this fetch/decode path, not the
+        // server) and isn't worth chasing yet. Always show the
+        // spinning-record placeholder in network mode until that's
+        // root-caused; drawNetAlbumArt() is left in place for when it is.
+        static const bool NET_ART_ENABLED = false;
+        coverHasArt = NET_ART_ENABLED && drawNetAlbumArt();
+        if (!coverHasArt) drawTurntableFrameDirect();
         return;
     }
     bool showTurntable = !coverHasArt || preferTurntable;
@@ -1513,11 +1594,13 @@ static void playNetSong(int idx, bool jumpToNowPlaying) {
     const char* ct = src->getContentType();
     bool flac = ct && strstr(ct, "flac");
     bool aac  = ct && (strstr(ct, "aac") || strstr(ct, "adts"));
-    curFormat = flac ? FMT_FLAC : aac ? FMT_AAC : FMT_MP3;
+    bool wav  = ct && strstr(ct, "wav");
+    curFormat = flac ? FMT_FLAC : aac ? FMT_AAC : wav ? FMT_WAV : FMT_MP3;
 
     netStream = src;
     decoder = flac ? (AudioGenerator*)new AudioGeneratorFLAC()
           : aac  ? (AudioGenerator*)new AudioGeneratorAAC()
+          : wav  ? (AudioGenerator*)new AudioGeneratorWAV()
                  : (AudioGenerator*)new AudioGeneratorMP3();
 
     if (decoder && decoder->begin(netStream, out)) {
@@ -3069,7 +3152,10 @@ void loop() {
                     }
                     else if (playState != STOPPED) { uiMode = MODE_NOWPLAYING; needsRedraw = true; }
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_FULLVIS) {
-                    enterFullVis();   // always starts at the Spectrum style
+                    // Full-screen viz needs a ~65KB sprite we don't have free
+                    // heap for once WiFi/HTTP is up, so it's disabled outright
+                    // in network mode rather than attempting and failing.
+                    if (!netStream) enterFullVis();   // always starts at the Spectrum style
                 } else if (uiMode == MODE_FULLVIS && c == KEY_FULLVIS) {
                     // Cycle Spectrum -> Dancers -> back to the regular Now Playing screen.
                     if (fullVisStyle == FULLVIS_SPECTRUM) {
@@ -3109,8 +3195,13 @@ void loop() {
                 } else if (uiMode == MODE_SETTINGS && c == KEY_BACK) {
                     uiMode = uiModeBeforeSettings; needsRedraw = true;
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_ART_TOGGLE) {
-                    preferTurntable = !preferTurntable;
-                    drawArtRegion();
+                    // Meaningless in network mode -- there's no turntable
+                    // sprite to fall back to there, and toggling would just
+                    // trigger a pointless re-fetch of the same art over HTTP.
+                    if (!netStream) {
+                        preferTurntable = !preferTurntable;
+                        drawArtRegion();
+                    }
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_VIS_STYLE) {
                     settingVisStyle = (VisStyle)((settingVisStyle + 1) % VIS_STYLE_COUNT);
                     drawVisualizer();
