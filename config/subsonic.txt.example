@@ -1,0 +1,15 @@
+# EMBER -- Subsonic/Gonic server
+# Copy this file to the root of the SD card as: subsonic.txt
+#
+# Line 1: server address (Gonic, Navidrome, Airsonic...)
+# Line 2: username
+# Line 3: password
+# Lines starting with '#' and blank lines are ignored.
+#
+# Default ports vary by server -- Gonic defaults to 4747, Navidrome to 4533.
+# Check your server's actual configuration rather than assuming either.
+#
+# Example for a local Gonic instance:
+http://192.168.1.10:4747
+my_username
+my_password

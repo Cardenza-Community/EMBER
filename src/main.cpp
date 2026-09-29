@@ -13,6 +13,10 @@
 #include "AudioGeneratorWAV.h"
 #include "AudioGeneratorAAC.h"
 #include "AudioOutput.h"
+#include "AudioFileSourceHTTPRange.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "network.h"
 #include "ember_logo.h"
 #include "turntable_frames.h"
 #include "dancer0_frames.h"
@@ -33,6 +37,7 @@ static const char KEY_ART_TOGGLE = 'a';   // Now Playing only: force turntable v
 static const char KEY_FULLVIS = 'v';      // Now Playing only: toggle full-screen visualizer
 static const char KEY_VIS_STYLE = 'z';    // Now Playing only: cycle the small visualizer's style
 static const char KEY_SCREENSHOT = 'c';   // any screen: save a BMP to SD; hold to burst-capture
+static const char KEY_NETWORK = 'w';      // any screen (except settings): open/close the network player
 // ENTER also opens/plays; backtick ` also goes back; SPACE = pause/resume
 
 // ---------- Directory model: one page at a time (all static, no heap) ----------
@@ -345,7 +350,7 @@ static PlayState playState = STOPPED;
 static char nowPlaying[64] = "";
 static int  volume = 50;                       // 0..255 (~20%)
 
-enum UiMode { MODE_BROWSER, MODE_NOWPLAYING, MODE_SETTINGS, MODE_FULLVIS };
+enum UiMode { MODE_BROWSER, MODE_NOWPLAYING, MODE_SETTINGS, MODE_FULLVIS, MODE_NET };
 static UiMode uiMode = MODE_BROWSER;
 static UiMode uiModeBeforeSettings = MODE_BROWSER;   // where to return to on back/'s'
 
@@ -449,6 +454,12 @@ static AudioFormat        curFormat = FMT_MP3;
 static AudioGenerator     *decoder = nullptr;
 static AudioFileSourceSD  *file = nullptr;
 static AudioFileSourceID3 *id3  = nullptr;
+// Remote playback (Subsonic/Gonic): the active network source is exposed as
+// netStream (AudioFileSource*) so the progress bar and seeking work for both
+// local and remote audio; netSrc is the reusable seekable HTTP object that
+// survives across tracks (its 16 KB buffer is allocated once per session).
+static AudioFileSource         *netStream = nullptr;
+static AudioFileSourceHTTPRange *netSrc   = nullptr;
 
 // ---------- Visualizer level history ----------
 // A cheap amplitude-based visualizer: no FFT, just the average |sample| of each
@@ -899,23 +910,52 @@ static void drawTurntableFrame() {
     turntableFrameIdx = (turntableFrameIdx + 1) % TURNTABLE_FRAME_COUNT;
 }
 
+// Same animation, but pushed straight to the display a row at a time instead
+// of into turntableSprite -- that sprite (~22KB) is deliberately not
+// resident during network mode (see freeArtSprites() below), and measured
+// free heap while actually streaming (~10-12KB) makes even this smaller
+// sprite an unreliable allocation there. A single 105-pixel row buffer (210
+// bytes) is cheap enough to keep on the stack instead. pushImage() with a
+// raw uint16_t array is a bulk copy straight onto the wire format, same as
+// writing into a sprite's raw buffer -- needs the same swap565 byte-swap as
+// drawTurntableFrame() above, or the theme colors come out wrong.
+static void drawTurntableFrameDirect() {
+    auto &d = M5Cardputer.Display;
+    uint16_t fg = (theme.file >> 8) | (theme.file << 8);
+    uint16_t bg = (theme.npBg >> 8) | (theme.npBg << 8);
+    const uint8_t* frame = &turntableFrames[turntableFrameIdx * TURNTABLE_BYTES_PER_FRAME];
+    uint16_t row[TURNTABLE_W];
+    for (int y = 0; y < TURNTABLE_H; y++) {
+        for (int x = 0; x < TURNTABLE_W; x++) {
+            int i = y * TURNTABLE_W + x;
+            bool on = (frame[i >> 3] >> (7 - (i & 7))) & 1;
+            row[x] = on ? fg : bg;
+        }
+        d.pushImage(COVER_X, COVER_Y + y, TURNTABLE_W, 1, row);
+    }
+    turntableFrameIdx = (turntableFrameIdx + 1) % TURNTABLE_FRAME_COUNT;
+}
+
 static void drawArtRegion();   // defined below; blits coverSprite to the screen
 
-// Called every loop() iteration; only animates (and only touches the
-// turntable sprite) while the turntable placeholder is actually the one
-// showing -- either because there's no real art, or preferTurntable forced it.
+// Called every loop() iteration; only animates while the turntable
+// placeholder is actually the one showing -- either because there's no real
+// art, or preferTurntable forced it (SD only -- KEY_ART_TOGGLE is a no-op in
+// network mode, so preferTurntable never applies there).
 // Also holds on the current frame while playback is paused/stopped, so the
 // "record" stops spinning right when the music does instead of running on
 // its own clock -- `last` is intentionally left untouched while paused, so
 // the animation resumes at the same 160ms cadence rather than jumping ahead.
 static void turntableTick() {
     static unsigned long last = 0;
-    if (uiMode != MODE_NOWPLAYING || !turntableSpriteOk) return;
+    if (uiMode != MODE_NOWPLAYING) return;
     if (coverHasArt && !preferTurntable) return;
     if (playState != PLAYING) return;
     unsigned long now = millis();
     if (now - last < 160) return;
     last = now;
+    if (netStream) { drawTurntableFrameDirect(); return; }
+    if (!turntableSpriteOk) return;
     drawTurntableFrame();
     drawArtRegion();
 }
@@ -1036,10 +1076,73 @@ static void loadAlbumArt(const char* path) {
     drawTurntableFrame();
 }
 
+// Remote album art (Subsonic/Gonic getCoverArt.view). No coverSprite here --
+// it (and turntableSprite) are freed for the whole time network mode is
+// active specifically to leave WiFi/HTTP enough heap (see freeArtSprites()
+// below) -- measured free heap while actually streaming was ~10-12KB, well
+// under even that sprite's own ~22KB alone. So this decodes straight onto
+// the display instead of into a sprite -- same "never buffer the whole
+// thing" principle AudioFileSourceHTTPRange already uses for audio; only the
+// JPEG/PNG decoder's own small internal block buffer is needed here, not a
+// frame-sized one.
+//
+// Runs fresh on every drawArtRegion() call rather than caching a decoded
+// copy (there's nowhere cheap to cache it to) -- acceptable since this only
+// fires on track changes and Now Playing redraws (e.g. after Settings), an
+// already-brief-stall-tolerant path, not the steady playback loop.
+static bool drawNetAlbumArt() {
+    String url = net::albumArtURL();
+    if (!url.length()) return false;
+
+    HTTPClient http;
+    WiFiClient plain;
+    WiFiClientSecure secure;
+    WiFiClient* client = &plain;
+    bool https = url.startsWith("https://");
+    if (https) { secure.setInsecure(); secure.setTimeout(8); client = &secure; }
+    else plain.setTimeout(8);
+    http.setTimeout(6000);
+    if (!http.begin(*client, url)) return false;
+
+    // Same HTTPClient::header() whitelisting gotcha fixed in
+    // AudioFileSourceHTTPRange::connectRange() -- collectHeaders() must be
+    // called before GET() or Content-Type always reads back empty.
+    static const char* kHeaders[] = { "Content-Type" };
+    http.collectHeaders(kHeaders, 1);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+    String ct = http.header("Content-Type");
+    bool isPng = ct.indexOf("png") >= 0;
+
+    WiFiClient* stream = http.getStreamPtr();
+    auto &d = M5Cardputer.Display;
+    // scale 0,0 => fit-to-box, same as loadAlbumArt()'s no-known-size case --
+    // there's no header to sniff image dimensions from mid-HTTP-stream.
+    bool ok = isPng ? d.drawPng(stream, COVER_X, COVER_Y, COVER_W, COVER_H, 0, 0, 0.0f, 0.0f)
+                     : d.drawJpg(stream, COVER_X, COVER_Y, COVER_W, COVER_H, 0, 0, 0.0f, 0.0f);
+    http.end();
+    return ok;
+}
+
 // SEAM: this is the only place the Now Playing screen paints the art box. Today it
 // blits the cached cover (or placeholder); a future audio visualizer can render live
 // here instead, without touching the loading/caching logic above.
 static void drawArtRegion() {
+    if (netStream) {
+        auto &d = M5Cardputer.Display;
+        d.fillRect(COVER_X, COVER_Y, COVER_W, COVER_H, COL_NP_BG);
+        // Real getCoverArt.view fetch is disabled for now -- it froze
+        // playback on at least one real album (the cover itself downloads
+        // fine via curl, so the hang is in this fetch/decode path, not the
+        // server) and isn't worth chasing yet. Always show the
+        // spinning-record placeholder in network mode until that's
+        // root-caused; drawNetAlbumArt() is left in place for when it is.
+        static const bool NET_ART_ENABLED = false;
+        coverHasArt = NET_ART_ENABLED && drawNetAlbumArt();
+        if (!coverHasArt) drawTurntableFrameDirect();
+        return;
+    }
     bool showTurntable = !coverHasArt || preferTurntable;
     if (showTurntable && turntableSpriteOk) turntableSprite->pushSprite(COVER_X, COVER_Y);
     else if (!showTurntable && coverSpriteOk) coverSprite->pushSprite(COVER_X, COVER_Y);
@@ -1351,6 +1454,8 @@ static void stopPlayback() {
     if (decoder) { if (decoder->isRunning()) decoder->stop(); delete decoder; decoder = nullptr; }
     if (id3)  { delete id3;  id3  = nullptr; }
     if (file) { delete file; file = nullptr; }
+    if (netStream) { delete netStream; netStream = nullptr; }
+    net::setCurrentInvalid();
     M5Cardputer.Speaker.stop();
 }
 
@@ -1410,6 +1515,142 @@ static void playQueuePos(int pos) {
 static void nextTrack() { playQueuePos(queuePos + 1); }
 static void prevTrack() { playQueuePos(queuePos - 1); }
 
+// ---------- Remote playback (Subsonic/Gonic, key 'w') ----------
+// The album-art sprites (~44 KB) are the biggest runtime allocations; WiFi +
+// HTTP need that heap on a no-PSRAM board, so they are freed while network
+// mode is active and recreated lazily on SD playback (every user of the
+// sprites is flag-guarded, so a freed sprite is safe).
+static void freeArtSprites() {
+    if (coverSprite)     { delete coverSprite;     coverSprite = nullptr; }
+    if (turntableSprite) { delete turntableSprite; turntableSprite = nullptr; }
+    coverSpriteOk = turntableSpriteOk = false;
+    coverHasArt = false;
+    artLoaded = false;
+    artCachedPath[0] = '\0';
+}
+
+static void ensureArtSprites() {
+    auto &d = M5Cardputer.Display;
+    if (!coverSpriteOk) {
+        coverSprite = new M5Canvas(&d);
+        coverSprite->setPsram(false);
+        coverSprite->setColorDepth(16);
+        coverSpriteOk = (coverSprite->createSprite(COVER_W, COVER_H) != nullptr);
+    }
+    if (!turntableSpriteOk) {
+        turntableSprite = new M5Canvas(&d);
+        turntableSprite->setPsram(false);
+        turntableSprite->setColorDepth(16);
+        turntableSpriteOk = (turntableSprite->createSprite(COVER_W, COVER_H) != nullptr);
+    }
+}
+
+// The active audio source, local (SD) or remote (network) -- the progress
+// bar and the MP3 seeking path use this instead of `file` directly.
+static AudioFileSource* activeAudioSource() {
+    return file ? (AudioFileSource*)file : (AudioFileSource*)netStream;
+}
+
+static void drawNowPlaying();   // defined below, in the Now Playing section
+
+// Play song <idx> of the loaded album over the network. Mirrors
+// playQueuePos(): AudioFileSourceHTTPRange -> decoder (MP3/AAC/FLAC per
+// Content-Type) -> out. Metadata comes from the Subsonic XML (title, artist,
+// album), not from ID3 tags in the stream.
+static void playNetSong(int idx, bool jumpToNowPlaying) {
+    if (idx < 0 || idx >= net::songCount()) return;
+
+    // Detach the reusable network source so stopPlayback() leaves it alive.
+    AudioFileSourceHTTPRange* src = netSrc;
+    netSrc = nullptr;
+
+    stopPlayback();
+    curArtist[0] = curTitle[0] = curAlbum[0] = '\0';
+    nowPlaying[0] = '\0';
+
+    net::showMessage("Connecting...", 0);
+    if (uiMode == MODE_NET) net::drawScreen();             // message bar feedback
+    else if (uiMode == MODE_NOWPLAYING) drawNowPlaying();
+
+    if (!src) src = new AudioFileSourceHTTPRange();
+    if (!src) {   // heap exhausted -- never dereference a null source
+        net::showMessage("Out of memory");
+        needsRedraw = true;
+        return;
+    }
+
+    String url = net::streamURL(idx);
+    if (!src->open(url.c_str())) {
+        netSrc = src;             // keep the object for the next attempt
+        playState = STOPPED;
+        net::showMessage("Playback failed");
+        uiMode = MODE_NET;
+        needsRedraw = true;
+        return;
+    }
+
+    // Decoder choice from the server's Content-Type (stream.view URLs carry
+    // no file extension).
+    const char* ct = src->getContentType();
+    bool flac = ct && strstr(ct, "flac");
+    bool aac  = ct && (strstr(ct, "aac") || strstr(ct, "adts"));
+    bool wav  = ct && strstr(ct, "wav");
+    curFormat = flac ? FMT_FLAC : aac ? FMT_AAC : wav ? FMT_WAV : FMT_MP3;
+
+    netStream = src;
+    decoder = flac ? (AudioGenerator*)new AudioGeneratorFLAC()
+          : aac  ? (AudioGenerator*)new AudioGeneratorAAC()
+          : wav  ? (AudioGenerator*)new AudioGeneratorWAV()
+                 : (AudioGenerator*)new AudioGeneratorMP3();
+
+    if (decoder && decoder->begin(netStream, out)) {
+        playState = PLAYING;
+        net::songMeta(idx, curArtist, sizeof(curArtist),
+                      curAlbum, sizeof(curAlbum),
+                      curTitle, sizeof(curTitle));
+        strncpy(nowPlaying, curTitle[0] ? curTitle : net::songTitle(idx), sizeof(nowPlaying) - 1);
+        nowPlaying[sizeof(nowPlaying) - 1] = '\0';
+        net::setCurrent(idx);
+        net::clearMessage();
+        if (jumpToNowPlaying) uiMode = MODE_NOWPLAYING;
+    } else {
+        stopPlayback();
+        playState = STOPPED;
+        net::showMessage("Playback failed");
+        uiMode = MODE_NET;
+    }
+    needsRedraw = true;
+}
+
+// A network song ended: advance inside the album, or stop back on the song
+// list (album-end behavior for remote albums is fixed to "stop" for now).
+static void netTrackEnded() {
+    int idx = net::currentIndex();
+    if (idx >= 0 && idx + 1 < net::songCount()) {
+        playNetSong(idx + 1, false);          // stay on Now Playing
+    } else {
+        stopPlayback();
+        playState = STOPPED;
+        nowPlaying[0] = '\0';
+        net::showMessage("End of album");
+        uiMode = MODE_NET;
+        needsRedraw = true;
+    }
+}
+
+// Leave network mode entirely: stop the stream, tear down WiFi, restore the
+// album-art sprites, back to the SD browser.
+static void exitNetMode() {
+    stopPlayback();
+    playState = STOPPED;
+    nowPlaying[0] = '\0';
+    if (netSrc) { delete netSrc; netSrc = nullptr; }
+    net::exit();
+    ensureArtSprites();
+    uiMode = MODE_BROWSER;
+    needsRedraw = true;
+}
+
 static void drawProgressBar();   // defined below, in the Now Playing section
 
 // ---------- Seeking (Now Playing screen: left/right "arrow" keys) ----------
@@ -1448,20 +1689,24 @@ static unsigned long rightHoldNext = 0, leftHoldNext = 0;
 
 static void seekBy(int32_t deltaBytes) {
     if (curFormat != FMT_MP3) return;   // see the note above -- no safe resync for FLAC/WAV/AAC
-    if (!file || !decoder || playState == STOPPED) return;
-    uint32_t size = file->getSize();
+    AudioFileSource* src = activeAudioSource();
+    if (!src || !decoder || playState == STOPPED) return;
+    uint32_t size = src->getSize();
     if (size == 0) return;
-    int64_t target = (int64_t)file->getPos() + deltaBytes;
+    int64_t target = (int64_t)src->getPos() + deltaBytes;
     if (target < 0) target = 0;
     if (target > (int64_t)size) target = (int64_t)size;
-    file->seek((int32_t)target, SEEK_SET);
+    // Remote MP3: the seek reconnects with "Range: bytes=pos-" -- slower than
+    // SD, but the decode-resync below is identical for both sources.
+    src->seek((int32_t)target, SEEK_SET);
     static_cast<AudioGeneratorMP3*>(decoder)->desync();
     drawProgressBar();   // instant feedback rather than waiting for the periodic tick
 }
 
 static void seekByPercent(float pct) {
-    if (curFormat != FMT_MP3 || !file) return;
-    seekBy((int32_t)(pct * file->getSize()));
+    AudioFileSource* src = activeAudioSource();
+    if (curFormat != FMT_MP3 || !src) return;
+    seekBy((int32_t)(pct * src->getSize()));
 }
 
 // Double-tapping left restarts the track instead of seeking backward. Reuses
@@ -1623,7 +1868,7 @@ static int battIconX() { return M5Cardputer.Display.width() - BATT_MARGIN - BATT
 // its own backdrop, so its color depends on whichever mode it's on top of.
 static uint16_t topStripBg() {
     UiMode effective = (uiMode == MODE_SETTINGS) ? uiModeBeforeSettings : uiMode;
-    return (effective == MODE_BROWSER) ? COL_HEADER : COL_NP_BG;
+    return (effective == MODE_BROWSER || effective == MODE_NET) ? COL_HEADER : COL_NP_BG;
 }
 
 // Redraws itself against whichever background the active screen already painted
@@ -1957,6 +2202,7 @@ static void drawFullVis();   // defined below, in the full-screen visualizer sec
 static void drawSettings() {
     if      (uiModeBeforeSettings == MODE_NOWPLAYING) drawNowPlaying();
     else if (uiModeBeforeSettings == MODE_FULLVIS)    drawFullVis();
+    else if (uiModeBeforeSettings == MODE_NET)        net::drawScreen();
     else                                               drawBrowser();
     // drawSettingsBox() below sets its own font first thing, regardless of
     // whatever the backdrop draw above left active.
@@ -2071,9 +2317,10 @@ static M5Canvas *progSprite = nullptr;
 static bool progSpriteOk = false;
 
 static void drawProgressBar() {
-    if (!file) return;
-    uint32_t sz = file->getSize();
-    uint32_t pos = file->getPos();
+    AudioFileSource* src = activeAudioSource();
+    if (!src) return;
+    uint32_t sz = src->getSize();
+    uint32_t pos = src->getPos();
     float frac = (sz > 0) ? (float)pos / (float)sz : 0.0f;
     if (frac < 0.0f) frac = 0.0f;
     if (frac > 1.0f) frac = 1.0f;
@@ -2725,6 +2972,27 @@ static void loadCustomThemes() {
     if (customThemeCount > 0) Serial.printf("loaded %d custom theme(s) from /themes\n", customThemeCount);
 }
 
+// ---------- Network module: accessors for network.cpp ----------
+// The network screens draw with the active theme's colors/fonts through
+// these, so they match EMBER's look whatever theme is selected.
+void emb_getNetPalette(NetPalette& p) {
+    p.bg = COL_BG;
+    p.header = COL_HEADER;
+    p.headerFg = theme.headerText;
+    p.selBg = COL_SEL_BG;
+    p.selFg = COL_SEL_FG;
+    p.fileFg = COL_FILE;
+    p.dimFg = COL_DIM;
+    p.headerH = HEADER_H;
+    p.rowH = ROW_H;
+    p.fontUI = FONT_UI;
+    p.fontBrowser = FONT_BROWSER;
+}
+void emb_drawStatusIcons() { drawStatusIcons(); }
+bool emb_uiIsNet() { return uiMode == MODE_NET; }
+bool emb_isNetPlaying() { return netStream != nullptr; }
+void emb_playNetSong(int idx, bool jumpToNowPlaying) { playNetSong(idx, jumpToNowPlaying); }
+
 void setup() {
     Serial.begin(115200);
     delay(1500);
@@ -2830,7 +3098,9 @@ void loop() {
     // ---- pump decoder; auto-advance on track end ----
     if (playState == PLAYING && decoder && decoder->isRunning()) {
         if (!decoder->loop()) {
-            if (queuePos + 1 < queueCount) {
+            if (netStream) {
+                netTrackEnded();      // remote album: next song, or stop at the end
+            } else if (queuePos + 1 < queueCount) {
                 nextTrack();          // more tracks left in this album
             } else {
                 // reached the end of the album -- behavior per the Settings screen
@@ -2863,6 +3133,7 @@ void loop() {
             if (ks.enter) {
                 if (uiMode == MODE_BROWSER) openSelected();
                 else if (uiMode == MODE_SETTINGS) cycleSetting(settingsCursor);
+                else if (uiMode == MODE_NET) net::onEnter();
             }
             if (ks.space) togglePause();
             for (char c : ks.word) {
@@ -2873,10 +3144,18 @@ void loop() {
                 } else if (c == KEY_NOWPLAYING) {
                     // Nothing to show there with no track loaded -- only allow
                     // switching in, not out (leaving Now Playing always works).
-                    if (uiMode == MODE_NOWPLAYING || uiMode == MODE_FULLVIS) { uiMode = MODE_BROWSER; needsRedraw = true; }
+                    // While a remote song is playing, "back" lands on the
+                    // network song list instead of the SD browser.
+                    if (uiMode == MODE_NOWPLAYING || uiMode == MODE_FULLVIS) {
+                        uiMode = netStream ? MODE_NET : MODE_BROWSER;
+                        needsRedraw = true;
+                    }
                     else if (playState != STOPPED) { uiMode = MODE_NOWPLAYING; needsRedraw = true; }
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_FULLVIS) {
-                    enterFullVis();   // always starts at the Spectrum style
+                    // Full-screen viz needs a ~65KB sprite we don't have free
+                    // heap for once WiFi/HTTP is up, so it's disabled outright
+                    // in network mode rather than attempting and failing.
+                    if (!netStream) enterFullVis();   // always starts at the Spectrum style
                 } else if (uiMode == MODE_FULLVIS && c == KEY_FULLVIS) {
                     // Cycle Spectrum -> Dancers -> back to the regular Now Playing screen.
                     if (fullVisStyle == FULLVIS_SPECTRUM) {
@@ -2892,7 +3171,14 @@ void loop() {
                     // exits, even in Now Playing where KEY_BACK itself now means
                     // "seek backward" instead (see below).
                     if (uiMode == MODE_SETTINGS)        { uiMode = uiModeBeforeSettings; needsRedraw = true; }
-                    else if (uiMode == MODE_NOWPLAYING || uiMode == MODE_FULLVIS) { uiMode = MODE_BROWSER; needsRedraw = true; }
+                    else if (uiMode == MODE_NOWPLAYING || uiMode == MODE_FULLVIS) {
+                        uiMode = netStream ? MODE_NET : MODE_BROWSER;
+                        needsRedraw = true;
+                    }
+                    // Steps up one browse level at a time (artists/albums/songs),
+                    // same as the dedicated back key -- only exits network mode
+                    // once goBack() reports we're already at the artist level.
+                    else if (uiMode == MODE_NET) { if (net::goBack()) exitNetMode(); }
                     else goBack();
                 } else if (uiMode == MODE_SETTINGS && c == KEY_UP) {
                     settingsCursor = (settingsCursor - 1 + SETTINGS_COUNT) % SETTINGS_COUNT;
@@ -2909,21 +3195,32 @@ void loop() {
                 } else if (uiMode == MODE_SETTINGS && c == KEY_BACK) {
                     uiMode = uiModeBeforeSettings; needsRedraw = true;
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_ART_TOGGLE) {
-                    preferTurntable = !preferTurntable;
-                    drawArtRegion();
+                    // Meaningless in network mode -- there's no turntable
+                    // sprite to fall back to there, and toggling would just
+                    // trigger a pointless re-fetch of the same art over HTTP.
+                    if (!netStream) {
+                        preferTurntable = !preferTurntable;
+                        drawArtRegion();
+                    }
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_VIS_STYLE) {
                     settingVisStyle = (VisStyle)((settingVisStyle + 1) % VIS_STYLE_COUNT);
                     drawVisualizer();
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_OPEN) {
                     // "right arrow" -- seek forward, or skip to next track on a quick double-tap
                     unsigned long now = millis();
-                    if (now - lastRightTapTime <= DOUBLE_TAP_MS) nextTrack();
+                    if (now - lastRightTapTime <= DOUBLE_TAP_MS) {
+                        if (netStream) net::playNext(+1);   // remote: next song
+                        else nextTrack();
+                    }
                     else seekByPercent(+SEEK_STEP_PCT);
                     lastRightTapTime = now;
                 } else if (uiMode == MODE_NOWPLAYING && c == KEY_BACK) {
                     // "left arrow" -- seek backward, or restart on a quick double-tap
                     unsigned long now = millis();
-                    if (now - lastLeftTapTime <= DOUBLE_TAP_MS) restartTrack();
+                    if (now - lastLeftTapTime <= DOUBLE_TAP_MS) {
+                        if (netStream) playNetSong(net::currentIndex(), false);
+                        else restartTrack();
+                    }
                     else seekByPercent(-SEEK_STEP_PCT);
                     lastLeftTapTime = now;
                 } else if (uiMode == MODE_BROWSER && c == KEY_BACK) {
@@ -2931,8 +3228,39 @@ void loop() {
                 } else if (uiMode == MODE_BROWSER && c == KEY_UP)   moveCursor(-1);
                 else if (uiMode == MODE_BROWSER && c == KEY_DOWN) moveCursor(+1);
                 else if (uiMode == MODE_BROWSER && c == KEY_OPEN) openSelected();
-                else if (c == KEY_NEXT)  nextTrack();
-                else if (c == KEY_PREV)  prevTrack();
+                else if (c == KEY_NETWORK) {
+                    // 'w' toggles the network player (Subsonic/Gonic). Entering
+                    // stops SD playback and frees the art sprites (WiFi + HTTP
+                    // need the heap); leaving restores them. If a remote song is
+                    // already streaming, 'w' just brings the browse screen back.
+                    if (uiMode == MODE_NET) exitNetMode();
+                    else if (uiMode != MODE_SETTINGS) {
+                        if (netStream) { uiMode = MODE_NET; needsRedraw = true; }
+                        else {
+                            stopPlayback();
+                            playState = STOPPED;
+                            nowPlaying[0] = '\0';
+                            freeArtSprites();
+                            uiMode = MODE_NET;    // before enter() so the
+                            net::enter();         // busy screen's icons match
+                            needsRedraw = true;
+                        }
+                    }
+                }
+                else if (uiMode == MODE_NET && c == KEY_UP)   net::moveCursor(-1);
+                else if (uiMode == MODE_NET && c == KEY_DOWN) net::moveCursor(+1);
+                else if (uiMode == MODE_NET && c == KEY_OPEN) net::onEnter();
+                else if (uiMode == MODE_NET && c == KEY_BACK) {
+                    if (net::goBack()) exitNetMode();
+                }
+                else if (c == KEY_NEXT) {
+                    if (netStream || uiMode == MODE_NET) net::playNext(+1);
+                    else nextTrack();
+                }
+                else if (c == KEY_PREV) {
+                    if (netStream || uiMode == MODE_NET) net::playNext(-1);
+                    else prevTrack();
+                }
                 else if (c == KEY_VOLUP) changeVolume(+15);
                 else if (c == KEY_VOLDN) changeVolume(-15);
                 else if (c == KEY_SCREENSHOT) saveScreenshot();
@@ -2987,6 +3315,7 @@ void loop() {
     if (!screenIsOff) {
         marqueeTick();
         turntableTick();
+        net::tick();
         static unsigned long lastProgressDraw = 0;
         if (uiMode == MODE_NOWPLAYING && playState != STOPPED && millis() - lastProgressDraw >= 500) {
             lastProgressDraw = millis();
@@ -3015,6 +3344,7 @@ void loop() {
         if      (uiMode == MODE_BROWSER)    drawBrowser();
         else if (uiMode == MODE_NOWPLAYING) drawNowPlaying();
         else if (uiMode == MODE_FULLVIS)    drawFullVis();
+        else if (uiMode == MODE_NET)        net::drawScreen();
         else                                drawSettings();
         needsRedraw = false;
     }
