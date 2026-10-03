@@ -1,4 +1,7 @@
 #include <M5Cardputer.h>
+#ifdef CARDENZA_TARGET
+#include "cardenza_hal.h"
+#endif
 #include <SD.h>
 #include <SPI.h>
 #include <Preferences.h>
@@ -389,6 +392,11 @@ static bool settingScreenshotsEnabled = false;
 enum AudioOutputMode { AUDIO_OUT_INTERNAL, AUDIO_OUT_EXTERNAL, AUDIO_OUT_MODE_COUNT };
 static const char* audioOutputLabels[AUDIO_OUT_MODE_COUNT] = { "Internal", "External DAC" };
 static AudioOutputMode settingAudioOutput = AUDIO_OUT_INTERNAL;
+#ifdef CARDENZA_TARGET
+static const int AUDIO_OUTPUT_CHOICES = 1; // External pins overlap the original keyboard matrix.
+#else
+static const int AUDIO_OUTPUT_CHOICES = AUDIO_OUT_MODE_COUNT;
+#endif
 
 static const int SETTINGS_COUNT = 6;
 static int settingsCursor = 0;
@@ -420,7 +428,7 @@ static void loadSettings() {
     if (settingScreenOffIdx < 0 || settingScreenOffIdx >= SCREEN_OFF_COUNT) settingScreenOffIdx = 2;
     if (albumEndMode < 0 || albumEndMode >= ALBUM_END_MODE_COUNT) albumEndMode = ALBUM_STOP;
     if (settingThemeIdx < 0) settingThemeIdx = 0;   // re-clamped against totalThemeCount() once custom themes load
-    if (settingAudioOutput < 0 || settingAudioOutput >= AUDIO_OUT_MODE_COUNT) settingAudioOutput = AUDIO_OUT_INTERNAL;
+    if (settingAudioOutput < 0 || settingAudioOutput >= AUDIO_OUTPUT_CHOICES) settingAudioOutput = AUDIO_OUT_INTERNAL;
 }
 
 // Called after every settings change (see cycleSetting()) -- infrequent,
@@ -1884,6 +1892,9 @@ static uint16_t topStripBg() {
 // getVBUSVoltage() (USB power actually present) is used instead, since
 // "plugged in" is the simpler and more honest signal to show.
 static void drawBatteryMeter() {
+#ifdef CARDENZA_TARGET
+    return; // No battery ADC, USB/charge detector or battery indicator on Cardenza.
+#endif
     auto &d = M5Cardputer.Display;
     uint16_t bg = topStripBg();
 
@@ -2232,7 +2243,7 @@ static void cycleSetting(int idx) {
             settingScreenshotsEnabled = !settingScreenshotsEnabled;
             break;
         case 4:
-            settingAudioOutput = (AudioOutputMode)((settingAudioOutput + 1) % AUDIO_OUT_MODE_COUNT);
+            settingAudioOutput = (AudioOutputMode)((settingAudioOutput + 1) % AUDIO_OUTPUT_CHOICES);
             break;
         case 5:
             settingThemeIdx = (settingThemeIdx + 1) % totalThemeCount();
@@ -3002,11 +3013,41 @@ void setup() {
     // confirms how many themes actually exist this boot.
     loadSettings();
     auto cfg = M5.config();
+#ifdef CARDENZA_TARGET
+    const bool cardenzaReady = cardenza_hal_init(32, 16);
+    cfg.fallback_board = m5::board_t::board_M5Cardputer;
+    cfg.internal_spk = false;
+    cfg.internal_mic = false;
+    cfg.internal_imu = false;
+    cfg.internal_rtc = false;
+    cfg.output_power = false;
+    cfg.external_speaker.hat_spk = false;
+#else
     cfg.external_speaker.hat_spk = true;
+#endif
     M5Cardputer.begin(cfg, true);
+#ifdef CARDENZA_TARGET
+    pinMode(46, INPUT);
+    if (!cardenzaReady) {
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        M5Cardputer.Display.drawString("Cardenza audio init failed", 4, 55);
+        Serial.println("Cardenza ES8156 setup failed");
+        for (;;) delay(1000);
+    }
+    Serial.println("[Cardenza] ES8156 32fs; battery/RGB disabled; external DAC pins unused");
+#endif
     delay(100);
 
     auto spk_cfg = M5Cardputer.Speaker.config();
+#ifdef CARDENZA_TARGET
+    spk_cfg.pin_bck = CARDENZA_I2S_BCLK;
+    spk_cfg.pin_ws = CARDENZA_I2S_LRCK;
+    spk_cfg.pin_data_out = CARDENZA_I2S_DATA;
+    spk_cfg.pin_mck = -1;
+    spk_cfg.stereo = true;
+    spk_cfg.buzzer = false;
+    spk_cfg.use_dac = false;
+#endif
     spk_cfg.sample_rate      = 44100;
     spk_cfg.task_pinned_core = APP_CPU_NUM;
     spk_cfg.dma_buf_count    = 8;
@@ -3015,7 +3056,10 @@ void setup() {
     M5Cardputer.Speaker.config(spk_cfg);
     M5Cardputer.Speaker.begin();
     M5Cardputer.Speaker.setVolume(volume);
+    #ifndef CARDENZA_TARGET
     initExtI2S();   // second, independent I2S peripheral -- see the comment above its definition
+
+    #endif
 
     auto &d = M5Cardputer.Display;
     d.setRotation(1);
