@@ -389,6 +389,10 @@ static bool settingScreenshotsEnabled = false;
 enum AudioOutputMode { AUDIO_OUT_INTERNAL, AUDIO_OUT_EXTERNAL, AUDIO_OUT_MODE_COUNT };
 static const char* audioOutputLabels[AUDIO_OUT_MODE_COUNT] = { "Internal", "External DAC" };
 static AudioOutputMode settingAudioOutput = AUDIO_OUT_INTERNAL;
+static int audioOutputChoices() {
+    // Header DAC pins overlap the original matrix on Cardenza/Cardputer.
+    return M5.getBoard() == m5::board_t::board_M5Cardputer ? 1 : AUDIO_OUT_MODE_COUNT;
+}
 
 static const int SETTINGS_COUNT = 6;
 static int settingsCursor = 0;
@@ -420,7 +424,7 @@ static void loadSettings() {
     if (settingScreenOffIdx < 0 || settingScreenOffIdx >= SCREEN_OFF_COUNT) settingScreenOffIdx = 2;
     if (albumEndMode < 0 || albumEndMode >= ALBUM_END_MODE_COUNT) albumEndMode = ALBUM_STOP;
     if (settingThemeIdx < 0) settingThemeIdx = 0;   // re-clamped against totalThemeCount() once custom themes load
-    if (settingAudioOutput < 0 || settingAudioOutput >= AUDIO_OUT_MODE_COUNT) settingAudioOutput = AUDIO_OUT_INTERNAL;
+    if (settingAudioOutput < 0 || settingAudioOutput >= audioOutputChoices()) settingAudioOutput = AUDIO_OUT_INTERNAL;
 }
 
 // Called after every settings change (see cycleSetting()) -- infrequent,
@@ -1884,6 +1888,7 @@ static uint16_t topStripBg() {
 // getVBUSVoltage() (USB power actually present) is used instead, since
 // "plugged in" is the simpler and more honest signal to show.
 static void drawBatteryMeter() {
+    if (M5.isCardenza()) return; // No battery/charge hardware.
     auto &d = M5Cardputer.Display;
     uint16_t bg = topStripBg();
 
@@ -2232,7 +2237,7 @@ static void cycleSetting(int idx) {
             settingScreenshotsEnabled = !settingScreenshotsEnabled;
             break;
         case 4:
-            settingAudioOutput = (AudioOutputMode)((settingAudioOutput + 1) % AUDIO_OUT_MODE_COUNT);
+            settingAudioOutput = (AudioOutputMode)((settingAudioOutput + 1) % audioOutputChoices());
             break;
         case 5:
             settingThemeIdx = (settingThemeIdx + 1) % totalThemeCount();
@@ -3000,10 +3005,18 @@ void setup() {
     // Backlight/screen-off/album-end are valid immediately; themeIdx is only
     // provisional until loadCustomThemes() (after SD.begin(), further down)
     // confirms how many themes actually exist this boot.
-    loadSettings();
     auto cfg = M5.config();
-    cfg.external_speaker.hat_spk = true;
+    cfg.internal_mic = false;
+    cfg.external_speaker.hat_spk = false;
     M5Cardputer.begin(cfg, true);
+    loadSettings(); // Hardware detection is needed before clamping output choices.
+    if (M5.isCardenza() && !M5.cardenzaCodecReady()) {
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        M5Cardputer.Display.drawString("Cardenza audio init failed", 4, 55);
+        Serial.println("Cardenza ES8156 setup failed");
+        for (;;) delay(1000);
+    }
+    if (M5.isCardenza()) Serial.println("[Cardenza] ES8156 runtime; external DAC pins unused");
     delay(100);
 
     auto spk_cfg = M5Cardputer.Speaker.config();
@@ -3015,7 +3028,7 @@ void setup() {
     M5Cardputer.Speaker.config(spk_cfg);
     M5Cardputer.Speaker.begin();
     M5Cardputer.Speaker.setVolume(volume);
-    initExtI2S();   // second, independent I2S peripheral -- see the comment above its definition
+    if (audioOutputChoices() > 1) initExtI2S();
 
     auto &d = M5Cardputer.Display;
     d.setRotation(1);
